@@ -3,53 +3,17 @@
 A2A Server - 返回固定的投资测试结果
 """
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-import time
-from a2a_base import (
-    AgentCard,
-    AgentSkill,
-    AgentCapabilities,
-    Task,
-    TaskStatus,
-    Message,
-    create_a2a_app,
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+from a2a.types import (
+    AgentCard, AgentSkill, AgentInterface, AgentCapabilities,
+    TaskState,
 )
-
-# ---------- Agent 配置 ----------
-
-AGENT_CARD = AgentCard(
-    name="investment-agent",
-    description="投资业务 Agent，负责投资分析、资产配置建议、风险评估等",
-    url="http://localhost:8002",
-    version="1.0.0",
-    capabilities=AgentCapabilities(
-        streaming=False,
-        pushNotifications=False,
-        stateTransitionHistory=False,
-    ),
-    skills=[
-        AgentSkill(
-            id="portfolio-analysis",
-            name="投资组合分析",
-            description="分析现有投资组合的收益与风险",
-            tags=["investment", "portfolio"],
-            examples=["分析我的当前持仓", "评估这个组合的风险等级"],
-        ),
-        AgentSkill(
-            id="asset-allocation",
-            name="资产配置建议",
-            description="根据风险偏好提供资产配置方案",
-            tags=["investment", "allocation"],
-            examples=["稳健型投资者该如何配置资产？", "推荐一个保守的资产配置方案"],
-        ),
-    ],
-)
+from a2a.helpers import new_text_message, new_task_from_user_message
 
 
-# ---------- 固定返回值 Handler ----------
+# ---------- 固定返回值 ----------
 
 FIXED_RESPONSE = """【投资建议 - 固定测试返回】
 
@@ -72,25 +36,59 @@ FIXED_RESPONSE = """【投资建议 - 固定测试返回】
 """
 
 
-def handle_task(task: Task) -> Task:
-    """处理任务并返回固定投资结果"""
-    task.status = TaskStatus(
-        state="completed",
-        message=Message(
-            role="agent",
-            parts=[{"type": "text", "text": FIXED_RESPONSE}],
+# ---------- Agent Executor ----------
+
+class InvestmentAgentExecutor(AgentExecutor):
+    async def execute(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+    ) -> None:
+        task = context.current_task
+        if not task:
+            task = new_task_from_user_message(context.message)
+            await event_queue.enqueue_event(task)
+
+        updater = TaskUpdater(event_queue, task.id, task.context_id)
+        final_message = new_text_message(
+            text=FIXED_RESPONSE,
+            context_id=task.context_id,
+            task_id=task.id,
+        )
+        await updater.complete(final_message)
+
+    async def cancel(
+        self, context: RequestContext, event_queue: EventQueue
+    ) -> None:
+        raise Exception("cancel not supported")
+
+
+# ---------- Agent Card ----------
+
+AGENT_CARD = AgentCard(
+    name="investment-agent",
+    description="投资业务 Agent，负责投资分析、资产配置建议、风险评估等",
+    version="1.0.0",
+    default_input_modes=['text'],
+    default_output_modes=['text'],
+    capabilities=AgentCapabilities(streaming=False),
+    skills=[
+        AgentSkill(
+            id="portfolio-analysis",
+            name="投资组合分析",
+            description="分析现有投资组合的收益与风险",
+            tags=["investment", "portfolio"],
+            examples=["分析我的当前持仓", "评估这个组合的风险等级"],
         ),
-    )
-    task.artifacts = [
-        {
-            "type": "text",
-            "text": FIXED_RESPONSE,
-            "metadata": {"agent": "investment-agent", "version": "1.0.0"},
-        }
-    ]
-    return task
-
-
-# ---------- FastAPI App ----------
-
-app = create_a2a_app(agent_card=AGENT_CARD, task_handler=handle_task)
+        AgentSkill(
+            id="asset-allocation",
+            name="资产配置建议",
+            description="根据风险偏好提供资产配置方案",
+            tags=["investment", "allocation"],
+            examples=["稳健型投资者该如何配置资产？", "推荐一个保守的资产配置方案"],
+        ),
+    ],
+    supported_interfaces=[
+        AgentInterface(protocol_binding='JSONRPC', url='http://localhost:8002')
+    ],
+)

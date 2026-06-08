@@ -4,6 +4,9 @@ import tempfile
 import asyncio
 from tqdm import tqdm
 
+# 禁用总超时，避免大文件下载中途断开
+_AIO_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=30, sock_read=300)
+
 
 class VideoDownloadAgent:
     async def invoke(
@@ -16,7 +19,7 @@ class VideoDownloadAgent:
             'is_task_complete': False
         }
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=_AIO_TIMEOUT) as session:
             async with session.get(query) as response:
                 with tempfile.NamedTemporaryFile(
                     delete=False,

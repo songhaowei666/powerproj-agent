@@ -6,10 +6,14 @@
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import uvicorn
-from server import app
+from a2a_base import create_server
+from investment_agent.server import InvestmentAgentExecutor, AGENT_CARD
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    create_server(
+        agent_executor=InvestmentAgentExecutor(),
+        agent_card=AGENT_CARD,
+        port=8002,
+    )
