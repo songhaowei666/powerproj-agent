@@ -108,7 +108,7 @@ class A2AServer:
     def _register_routes(self):
         app = self.app
 
-        @app.get("/.well-known/agent.json")
+        @app.get("/.well-known/agent-card.json")
         async def get_agent_card():
             return self.agent_card.model_dump(exclude_none=True)
 

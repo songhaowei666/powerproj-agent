@@ -1,13 +1,19 @@
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
 import asyncio
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+
+from providers.llm_provider import get_llm
 
 prompt = ChatPromptTemplate(
     [("system","你是一个专业的AI助手"),("human","{query}")]
 )
 
-llm = ChatOpenAI(model="",base_url="",api_key="")
+llm = get_llm()
 
 class ChatAgent:
     def __init__(self):
