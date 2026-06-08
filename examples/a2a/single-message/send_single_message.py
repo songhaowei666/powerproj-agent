@@ -5,7 +5,7 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.server.events import EventQueue
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.types import AgentCapabilities, AgentCard, AgentSkill
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill, AgentInterface
 from a2a.helpers import new_text_message
 from chat_agent import ChatAgent
 
@@ -21,12 +21,12 @@ skill = AgentSkill(
 public_agent_card = AgentCard(
     name='流式Chat服务智能体',
     description='流式Chat服务智能体,提供对话服务',
-    url='http://localhost:9999/',
     version='1.0.0',
     default_input_modes=['text'],
     default_output_modes=['text'],
     capabilities=AgentCapabilities(streaming=True),
     skills=[skill],
+    supported_interfaces=[AgentInterface(protocol_binding='JSONRPC', url='http://localhost:9999/')],
 )
 
 
@@ -44,8 +44,8 @@ class StreamChatAgentExecutor(AgentExecutor):
         async for chunk in self.agent.invoke(query):
             print(chunk, end="", flush=True)
             full_context = full_context + chunk
-            await event_queue.enqueue_event(
-                new_text_message(full_context))
+        await event_queue.enqueue_event(
+            new_text_message(full_context))
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue

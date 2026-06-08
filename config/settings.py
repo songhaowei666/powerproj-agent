@@ -1,13 +1,16 @@
 """全局配置管理，基于 pydantic-settings 读取 .env 文件。"""
 
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# 始终指向项目根目录的 .env 文件
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 class Settings(BaseSettings):
     """应用全局配置，字段名与 .env 中的变量名保持一致。"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
     )
