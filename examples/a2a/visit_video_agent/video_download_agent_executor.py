@@ -90,7 +90,7 @@ public_agent_card = AgentCard(
 
 
 if __name__ == "__main__":
-    from examples.default_server import create_server
+    from examples.a2a.default_server import create_server
     create_server(
         agent_card=public_agent_card,
         agent_executor=VideoDownloadAgentExecutor(),
