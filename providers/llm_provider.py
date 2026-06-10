@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from config import settings
 
 
@@ -17,6 +17,16 @@ def get_llm() -> ChatOpenAI:
     if settings.openai_api_base:
         kwargs["base_url"] = settings.openai_api_base
     return ChatOpenAI(**kwargs)
+
+
+def get_embedding() -> OpenAIEmbeddings:
+    """获取统一配置的 OpenAI Embedding 实例。"""
+    kwargs = {"model": settings.embedding_model}
+    if settings.openai_api_key:
+        kwargs["api_key"] = settings.openai_api_key
+    if settings.openai_api_base:
+        kwargs["base_url"] = settings.openai_api_base
+    return OpenAIEmbeddings(**kwargs)
 
 
 if __name__ == "__main__":
