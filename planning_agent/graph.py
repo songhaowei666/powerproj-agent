@@ -52,14 +52,40 @@ NODE_CODE_MAP = {
 }
 
 
-def _is_aggregate_query(query: str) -> bool:
-    """判断是否为聚合查询。"""
-    aggregate_keywords = [
-        "总和", "平均", "一共", "总计", "统计", "多少", "几个",
-        "sum", "avg", "count", "max", "min", "total",
-    ]
-    query_lower = query.lower()
-    return any(kw in query_lower for kw in aggregate_keywords)
+async def _is_aggregate_query(query: str, llm: BaseChatModel) -> bool:
+    """使用 LLM 判断是否为聚合查询（SUM/AVG/COUNT/MAX/MIN 等统计类查询）。
+
+    聚合查询特征：要求对多行数据进行汇总统计，如求和、平均值、计数、
+    最大值、最小值等。非聚合查询特征：查询某个具体项目的属性详情。
+
+    LLM 判断失败时回退到关键词匹配。
+    """
+    try:
+        structured_llm = llm.with_structured_output(
+            schema=dict,
+            method="json_mode",
+        )
+        result = await structured_llm.ainvoke(
+            [
+                (
+                    "system",
+                    "你是查询分类专家。判断用户查询是否为聚合统计查询。"
+                    "聚合查询：要求汇总统计（求和/平均/计数/最大/最小）。"
+                    "非聚合查询：查询具体项目属性详情。"
+                    "仅输出 JSON：{\"is_aggregate\": true/false}",
+                ),
+                ("human", query),
+            ]
+        )
+        return bool(result.get("is_aggregate", False))
+    except Exception:
+        # LLM 失败时回退到关键词匹配
+        aggregate_keywords = [
+            "总和", "平均", "一共", "总计", "统计", "多少", "几个",
+            "sum", "avg", "count", "max", "min", "total",
+        ]
+        query_lower = query.lower()
+        return any(kw in query_lower for kw in aggregate_keywords)
 
 
 def _extract_node_code(query: str) -> str:
@@ -132,7 +158,7 @@ def build_planning_graph(
             return state
 
         # 聚合查询不需要匹配具体项目
-        if state.intent == "query_project" and _is_aggregate_query(state.query):
+        if state.intent == "query_project" and await _is_aggregate_query(state.query, llm):
             return state
 
         # 文件操作也需要先匹配项目
@@ -145,13 +171,13 @@ def build_planning_graph(
         state.matched_project = matched
         return state
 
-    def confirm_project(state: PlanningState) -> PlanningState:
+    async def confirm_project(state: PlanningState) -> PlanningState:
         """确认项目。聚合查询跳过确认。"""
         if state.status == "failed":
             return state
 
         # 聚合查询不需要确认项目
-        if state.intent == "query_project" and _is_aggregate_query(state.query):
+        if state.intent == "query_project" and await _is_aggregate_query(state.query, llm):
             state.project_confirmed = True
             return state
 
@@ -212,7 +238,7 @@ def build_planning_graph(
         intent = state.intent
 
         if intent == "query_project":
-            if _is_aggregate_query(state.query):
+            if await _is_aggregate_query(state.query, llm):
                 # 聚合查询
                 sql = await _generate_aggregate_sql(llm, state.query)
                 result = db.execute_aggregate_query(sql)

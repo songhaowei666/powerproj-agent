@@ -30,6 +30,7 @@ class A2AValidator:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.results: Dict[str, Any] = {}
+        self.last_task_id: str | None = None
 
     async def validate(self, test_message: str = "你好，请简单回复") -> Dict[str, Any]:
         """执行完整验证流程。
@@ -72,6 +73,85 @@ class A2AValidator:
             await self._check_streaming(client, agent_card, test_message)
 
         return self.results
+
+    async def send_message(
+        self,
+        message_text: str,
+        task_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """向 A2A 服务发送单条消息（支持指定 task_id 进行多轮对话）。
+
+        Args:
+            message_text: 消息内容
+            task_id: 指定任务 ID（用于继续已有对话）；为 None 时自动创建新任务
+
+        Returns:
+            包含响应结果的字典
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            return await self._send_raw_message(client, message_text, task_id)
+
+    async def _send_raw_message(
+        self,
+        client: httpx.AsyncClient,
+        message_text: str,
+        task_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """底层：直接发送 JSON-RPC SendMessage 请求。"""
+        import google.protobuf.json_format as json_format
+        from a2a.types.a2a_pb2 import SendMessageRequest, SendMessageConfiguration
+
+        req = SendMessageRequest()
+        if task_id:
+            # 继续已有对话：显式指定 task_id
+            req.message.task_id = task_id
+        req.message.message_id = uuid4().hex
+        req.message.role = Role.ROLE_USER
+        req.message.parts.add().text = message_text
+        req.configuration.CopyFrom(SendMessageConfiguration())
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "SendMessage",
+            "params": json_format.MessageToDict(req),
+            "id": 1,
+        }
+        resp = await client.post(
+            self.base_url + "/",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "A2A-Version": "1.0",
+            },
+        )
+        resp.raise_for_status()
+        rpc_body = resp.json()
+
+        if rpc_body.get("error"):
+            return {
+                "status": "failed",
+                "detail": f"JSON-RPC Error {rpc_body['error'].get('code')}: {rpc_body['error'].get('message')}",
+                "data": rpc_body,
+            }
+
+        rpc_result = rpc_body.get("result", {})
+        task_state = rpc_result.get("status", {}).get("state", "")
+        state_name = (
+            task_state.replace("TASK_STATE_", "").lower()
+            if isinstance(task_state, str)
+            else str(task_state)
+        )
+
+        # 记录服务端返回的 task_id
+        returned_task_id = rpc_result.get("id", task_id or "")
+        self.last_task_id = returned_task_id
+
+        return {
+            "status": "passed",
+            "detail": f"Task 状态: {state_name}",
+            "data": rpc_result,
+            "task_id": returned_task_id,
+        }
 
     async def _check_connectivity(self, client: httpx.AsyncClient) -> None:
         try:
@@ -119,36 +199,8 @@ class A2AValidator:
         agent_card: Any,
         message_text: str,
     ) -> None:
-        try:
-            config = ClientConfig(httpx_client=client, streaming=False)
-            factory = ClientFactory(config)
-            a2a_client = factory.create(agent_card)
-
-            message = Message(
-                role=Role.ROLE_USER,
-                parts=[Part(text=message_text)],
-                message_id=uuid4().hex,
-            )
-            request = SendMessageRequest(
-                message=message,
-                configuration=SendMessageConfiguration(),
-            )
-
-            responses = []
-            async for response in a2a_client.send_message(request):
-                responses.append(response)
-
-            self.results["single_message"] = {
-                "status": "passed",
-                "detail": f"收到 {len(responses)} 条响应",
-                "data": responses,
-            }
-        except Exception as exc:  # noqa: BLE001
-            self.results["single_message"] = {
-                "status": "failed",
-                "detail": f"{type(exc).__name__}: {exc}",
-                "data": None,
-            }
+        result = await self._send_raw_message(client, message_text)
+        self.results["single_message"] = result
 
     async def _check_streaming(
         self,
