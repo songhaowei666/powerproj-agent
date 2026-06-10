@@ -106,25 +106,32 @@ class PlanningAgentExecutor(AgentExecutor):
 
         config = {"configurable": {"thread_id": task_id}}
 
-        # 检查 graph 当前状态
-        graph_state = await self._graph.aget_state(config)
-
-        if graph_state and graph_state.next:
-            # 图处于中断状态 -> 恢复执行
-            from langgraph.types import Command
-
-            result = await self._graph.ainvoke(Command(resume=current_text), config)
-        else:
-            # 新请求
-            initial_state = PlanningState(
-                query=current_text,
-                pending_files=pending_files,
-            )
-            result = await self._graph.ainvoke(initial_state, config)
+        from langgraph.errors import GraphInterrupt
+        from langgraph.types import Command
 
         updater = TaskUpdater(event_queue, task_id, context_id)
 
-        # 再次检查是否仍为中断状态
+        try:
+            # 检查 graph 当前状态
+            graph_state = await self._graph.aget_state(config)
+
+            if graph_state and graph_state.next:
+                # 图处于中断状态 -> 恢复执行
+                result = await self._graph.ainvoke(
+                    Command(resume=current_text), config
+                )
+            else:
+                # 新请求
+                initial_state = PlanningState(
+                    query=current_text,
+                    pending_files=pending_files,
+                )
+                result = await self._graph.ainvoke(initial_state, config)
+        except GraphInterrupt:
+            # 执行过程中触发 interrupt -> 返回 input-required
+            pass
+
+        # 检查是否为中断状态（interrupt 可能通过异常或正常返回触发）
         graph_state = await self._graph.aget_state(config)
         if graph_state and graph_state.next:
             try:
