@@ -9,7 +9,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from a2a_base import create_server
-from planning_agent.server import PlanningAgentExecutor, AGENT_CARD, EXTRA_ROUTES
+from planning_agent.executor import PlanningAgentExecutor
+from planning_agent.server import AGENT_CARD, EXTRA_ROUTES
 
 if __name__ == "__main__":
     create_server(
@@ -17,4 +18,5 @@ if __name__ == "__main__":
         agent_card=AGENT_CARD,
         port=8001,
         extra_routes=EXTRA_ROUTES,
+        log_level="debug",
     )

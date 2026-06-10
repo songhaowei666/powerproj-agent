@@ -240,13 +240,25 @@ def build_planning_graph(llm: BaseChatModel, db: ProjectDatabase, fm: FileManage
     """
 ```
 
-### 5.5 server.py
+### 5.5 executor.py
 
-与 `main_agent/server.py` 保持一致：
-- 自定义 FastAPI 路由，支持 `tasks/send`、`tasks/get`、`tasks/cancel`
+```python
+class PlanningAgentExecutor(AgentExecutor):
+    def __init__(self, llm=None, db=None, fm=None)
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None
+```
+
+- A2A AgentExecutor 实现，负责接收 A2A 请求、驱动 LangGraph、组装 A2A 响应
+- 将 message 中的文件提取为 base64，避免 checkpointer 序列化失败
 - 使用 `task.id` 作为 LangGraph `thread_id`
 - 检测 graph 中断状态，返回 `input-required` 或 `completed`/`failed`
-- 额外注册静态文件路由 `/files/{file_id}` 供文件下载
+
+### 5.6 server.py
+
+- 构造 protobuf AgentCard（`_build_agent_card`）
+- 注册静态文件路由 `/files/{file_id}` 供文件下载
+- 对外暴露 `AGENT_CARD`、`EXTRA_ROUTES`、`PlanningAgentExecutor`（从 executor.py 导入）
 
 ---
 
@@ -399,7 +411,8 @@ planning_agent/
 ├── project_matcher.py   # 自然语言项目匹配（LLM + SQL）
 ├── file_manager.py      # 本地文件存取管理
 ├── graph.py             # LangGraph 状态图定义与节点实现
-├── server.py            # FastAPI A2A Server（自定义路由 + 文件下载路由）
+├── executor.py          # A2A AgentExecutor 实现（LangGraph 驱动 + 响应组装）
+├── server.py            # A2A Server（AgentCard + 文件下载路由）
 ├── client.py            # A2A 客户端（测试用，保留现有）
 ├── main.py              # 启动入口（保留现有）
 └── upload_files/        # 文件存储根目录（.gitignore 忽略）

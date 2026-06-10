@@ -51,8 +51,13 @@ def create_server(
     port: int,
     host: str = '0.0.0.0',
     extra_routes: Sequence[BaseRoute] | None = None,
+    **uvicorn_kwargs,
 ):
-    """启动 A2A 服务"""
+    """启动 A2A 服务
+
+    Args:
+        uvicorn_kwargs: 透传给 uvicorn.run 的额外参数（如 log_level, reload 等）
+    """
     uvicorn.run(
         get_a2a_app(
             agent_executor=agent_executor,
@@ -61,4 +66,5 @@ def create_server(
         ),
         host=host,
         port=port,
+        **uvicorn_kwargs,
     )
