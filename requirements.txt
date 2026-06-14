@@ -1,0 +1,22 @@
+# 核心依赖
+a2a-sdk
+langchain
+langchain-openai
+langgraph
+pydantic
+pydantic-settings
+starlette
+uvicorn
+httpx
+
+# 测试依赖
+pytest
+pytest-asyncio
+
+# A2A 验证器 UI
+streamlit
+
+# 示例（可选）
+aiohttp
+tqdm
+modelscope

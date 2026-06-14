@@ -28,17 +28,18 @@ flowchart TB
 
 ### 核心流程
 
-1. **意图识别**：将自然语言 query 解析为带依赖关系的任务列表（统计 / 规划 / 投资）
-2. **置信度补全**：任务为空或任意任务置信度 < 0.8 时，通过 `interrupt` 暂停并返回 `input-required`，等待用户补充后重新识别
-3. **分阶段并行**：按 DAG 拓扑分层，同层任务 `asyncio.gather` 并行，层间串行
-4. **失败熔断**：单任务最多重试 3 次，任一任务最终失败则终止后续 Phase
-5. **结果汇总**：LLM 生成自然语言总结，并保留各业务 Agent 原始 artifacts
+1. **Agent 网络发现**：主控 Agent 启动时拉取下游 Agent Card，构建可用能力列表
+2. **意图识别**：将自然语言 query 解析为带依赖关系的任务列表（统计 / 规划 / 投资）
+3. **置信度补全**：任务为空或任意任务置信度 < 0.8 时，通过 `interrupt` 暂停并返回 `input-required`，等待用户补充后重新识别
+4. **分阶段并行**：按 DAG 拓扑分层，同层任务 `asyncio.gather` 并行，层间串行
+5. **失败熔断**：单任务最多重试 3 次，任一任务最终失败则终止后续 Phase
+6. **结果汇总**：LLM 生成自然语言总结，并保留各业务 Agent 原始 artifacts
 
 ## Agent 一览
 
 | Agent | 目录 | 端口 | 说明 |
 |-------|------|------|------|
-| 主控 Agent | `main_agent/` | 8000 | 用户统一入口，任务编排与结果聚合 |
+| 主控 Agent | `main_agent/` | 8000 | 用户统一入口，Agent 网络发现、任务编排与结果聚合 |
 | 规划 Agent | `planning_agent/` | 8001 | 电力项目匹配、信息查询、节点文件管理（SQLite） |
 | 投资 Agent | `investment_agent/` | 8002 | 电力项目投资测算与造价分析 |
 | 统计 Agent | `statistics_agent/` | 8003 | 电力项目规模统计与指标对比 |
@@ -58,8 +59,8 @@ flowchart TB
 | 层级 | 技术 |
 |------|------|
 | A2A 协议 | `a2a-sdk` |
-| LLM 框架 | `langchain`, `langgraph` |
-| Web 框架 | `starlette` / `fastapi` + `uvicorn` |
+| LLM 框架 | `langchain`, `langchain-openai`, `langgraph` |
+| Web 框架 | `starlette` + `uvicorn` |
 | 配置管理 | `pydantic-settings` + `.env` |
 | 数据库 | SQLite（Planning Agent） |
 | HTTP 客户端 | `httpx` |
@@ -82,8 +83,8 @@ powerproj-agent/
 ├── rag/                  # RAG 基础设施（预留）
 ├── examples/             # A2A 调用示例与演示脚本
 ├── spec/                 # 各 Agent 技术规格文档
-├── tests/                # 集成测试
-└── AGENTS.md             # Agent 开发约束与编码规范
+├── AGENTS.md             # Agent 开发约束与编码规范
+└── requirements.txt      # 项目依赖
 ```
 
 ## 快速开始
@@ -99,9 +100,8 @@ cd powerproj-agent
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-# 安装依赖（项目暂未提供 requirements.txt，以下为常用包）
-pip install a2a-sdk langchain langchain-openai langgraph pydantic-settings \
-    fastapi uvicorn starlette httpx pytest pytest-asyncio streamlit \
+# 安装依赖
+pip install -r requirements.txt \
     -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
 ```
 
@@ -110,17 +110,25 @@ pip install a2a-sdk langchain langchain-openai langgraph pydantic-settings \
 在项目根目录创建 `.env` 文件：
 
 ```env
+# 必需：OpenAI 兼容接口
 OPENAI_API_KEY=your-api-key
-OPENAI_API_BASE=https://your-api-base/v1   # 可选，OpenAI 兼容接口地址
+OPENAI_API_BASE=https://your-api-base/v1   # 可选，默认使用 OpenAI 官方接口
+
+# 可选：模型名称
 CHAT_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-large
+
+# 可选第三方服务
+GEMINI_API_KEY=your-gemini-key
+JINA_API_KEY=your-jina-key
+MINERU_API_KEY=your-mineru-key
 ```
 
 所有配置通过 `config/settings.py` 统一读取，各模块禁止直接访问 `os.environ`。
 
 ### 3. 启动服务
 
-各 Agent 需分别启动。建议先启动业务 Agent，再启动主控 Agent：
+各 Agent 需分别启动。**必须先启动业务 Agent，再启动主控 Agent**：主控 Agent 在生命周期内会调用 `agent_network.discover()` 拉取下游 Agent Card，若业务 Agent 未就绪会导致发现失败。
 
 ```bash
 # 终端 1 - 规划 Agent
@@ -175,6 +183,28 @@ curl -X POST http://localhost:8000/ \
 | `input-required` | 需要补充信息 | 用相同 `id` 再次 `tasks/send`，携带补充内容 |
 | `failed` | 执行失败 | 读取错误信息 |
 
+#### 中断恢复示例
+
+当主控返回 `input-required` 时，客户端使用相同 `id` 再次发送即可恢复：
+
+```bash
+curl -X POST http://localhost:8000/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tasks/send",
+    "params": {
+      "id": "task-001",
+      "sessionId": "session-001",
+      "message": {
+        "role": "user",
+        "parts": [{"type": "text", "text": "2025 年"}]
+      }
+    },
+    "id": 2
+  }'
+```
+
 ### 5. A2A 协议验证
 
 使用 Streamlit 验证器对任意 A2A 端点进行健康检查：
@@ -183,7 +213,14 @@ curl -X POST http://localhost:8000/ \
 streamlit run a2a_validator/app.py
 ```
 
-验证项包括：连通性探测、Agent Card 解析、单消息测试、流式测试。
+验证器按以下顺序执行，前置失败则后续短路：
+
+| 验证项 | 说明 |
+|--------|------|
+| 连通性探测 | 检查 `GET {base_url}` 是否可达 |
+| Agent Card | 检查 `/.well-known/agent.json` 是否可解析 |
+| 单消息测试 | 使用 `tasks/send` 发送测试消息 |
+| 流式测试 | 根据 Agent Card 的 `streaming` 能力决定是否测试 SSE 流式响应 |
 
 ## 规划 Agent 能力
 
@@ -193,7 +230,7 @@ streamlit run a2a_validator/app.py
 - **多轮交互确认**：匹配结果需用户确认（`input-required` + `interrupt` 恢复）
 - **项目信息查询**：支持明细查询与聚合统计（如变电容量总和、项目数量等）
 - **节点文件管理**：按节点编码（001 可研设计 / 002 可研评审 / 003 可研批复）上传、下载、删除文件
-- **文件下载路由**：`GET /files/{file_id}`
+- **文件下载路由**：`GET /files/{file_id}`，例如 `http://localhost:8001/files/1`
 
 详细规格见 [`spec/planning_agent_spec.md`](spec/planning_agent_spec.md)。
 
@@ -201,27 +238,34 @@ streamlit run a2a_validator/app.py
 
 `examples/` 目录提供 A2A 协议交互参考：
 
-| 目录 | 说明 |
-|------|------|
-| `examples/a2a/single-message/` | 单消息基础 Server / Client |
-| `examples/a2a/streaming/` | SSE 流式推送完整链路 |
-| `examples/a2a/visit_video_agent/` | 带进度反馈和文件 Artifact 的 Agent |
-| `examples/agents/task_planning_and_dispatch/` | 任务规划与分发参考 |
+| 目录 | 说明 | 运行方式 |
+|------|------|----------|
+| `examples/a2a/single-message/` | 单消息基础 Server / Client | 分别启动 `server.py` 与 `client.py` |
+| `examples/a2a/streaming/` | SSE 流式推送完整链路 | 启动 `server.py` 后运行 `client.py` |
+| `examples/a2a/visit_video_agent/` | 带进度反馈和文件 Artifact 的视频下载 Agent | 启动 `video_download_agent.py` 后运行 `video_download_client.py` |
+| `examples/agents/task_planning_and_dispatch/` | 任务规划与分发参考 | 按目录内 README 说明运行 |
 
 详见 [`examples/a2a/README.md`](examples/a2a/README.md)。
 
 ## 测试
 
-```bash
-# 运行全部测试
-pytest tests/ -v
+测试按 `unit/` 与 `functional/` 组织：
 
+```bash
 # 运行 Planning Agent 单元测试
-pytest planning_agent/tests/ -v
+pytest planning_agent/tests/unit -v
+
+# 运行 Main Agent 单元测试
+pytest main_agent/tests/unit -v
 
 # 运行 A2A 验证器测试
-pytest a2a_validator/tests/ -v
+pytest a2a_validator/tests -v
+
+# 运行功能测试（默认跳过，需显式开启）
+RUN_FUNCTIONAL_TESTS=1 pytest planning_agent/tests/functional -v
 ```
+
+功能测试直接访问真实目录和服务，不模拟数据。更多测试规范见 [`AGENTS.md`](AGENTS.md)。
 
 ## 规格文档
 
