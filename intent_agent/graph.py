@@ -1,6 +1,6 @@
 """LangGraph StateGraph 定义与节点实现。"""
 
-from typing import TypedDict, List, Dict, Optional
+from typing import TypedDict, List, Dict, Sequence, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -15,6 +15,7 @@ class IntentState(TypedDict):
     """LangGraph 状态定义。"""
 
     query: str
+    agent_cards: Sequence
     few_shots: List[Dict]
     result: Optional[IntentResult]
 
@@ -22,12 +23,19 @@ class IntentState(TypedDict):
 async def retrieve_few_shots_node(state: IntentState) -> IntentState:
     """调用 rag_stub 获取少样本示例。"""
     few_shots = await retrieve_similar_examples(state["query"], k=3)
-    return {"query": state["query"], "few_shots": few_shots, "result": None}
+    return {
+        "query": state["query"],
+        "agent_cards": state["agent_cards"],
+        "few_shots": few_shots,
+        "result": None,
+    }
 
 
 async def plan_tasks_node(state: IntentState, llm: BaseChatModel) -> IntentState:
     """构建 prompt，调用 LLM 生成结构化任务规划。"""
-    system_prompt = build_system_prompt(state["few_shots"])
+    system_prompt = build_system_prompt(
+        state["few_shots"], state["agent_cards"]
+    )
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=state["query"]),
@@ -36,7 +44,12 @@ async def plan_tasks_node(state: IntentState, llm: BaseChatModel) -> IntentState
     structured_llm = llm.with_structured_output(IntentResult)
     result = await structured_llm.ainvoke(messages)
 
-    return {"query": state["query"], "few_shots": state["few_shots"], "result": result}
+    return {
+        "query": state["query"],
+        "agent_cards": state["agent_cards"],
+        "few_shots": state["few_shots"],
+        "result": result,
+    }
 
 
 def build_intent_graph(llm: BaseChatModel):

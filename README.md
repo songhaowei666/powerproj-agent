@@ -40,8 +40,8 @@ flowchart TB
 |-------|------|------|------|
 | 主控 Agent | `main_agent/` | 8000 | 用户统一入口，任务编排与结果聚合 |
 | 规划 Agent | `planning_agent/` | 8001 | 电力项目匹配、信息查询、节点文件管理（SQLite） |
-| 投资 Agent | `investment_agent/` | 8002 | 投资分析（当前为固定测试返回） |
-| 统计 Agent | `statistics_agent/` | 8003 | 数据统计分析（当前为固定测试返回） |
+| 投资 Agent | `investment_agent/` | 8002 | 电力项目投资测算与造价分析 |
+| 统计 Agent | `statistics_agent/` | 8003 | 电力项目规模统计与指标对比 |
 | 意图识别 | `intent_agent/` | — | 内嵌于主控 Agent，非独立服务 |
 | A2A 验证器 | `a2a_validator/` | — | Streamlit 诊断工具，验证任意 A2A 端点 |
 

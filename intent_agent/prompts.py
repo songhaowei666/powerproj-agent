@@ -1,30 +1,32 @@
-"""System prompt 模板 + 少样本拼接逻辑。"""
+"""System prompt 模板 + AgentCard 能力提取 + 少样本拼接逻辑。"""
 
 import json
-from typing import List, Dict
+from typing import List, Dict, Sequence
 
 from intent_agent.models import IntentResult
 
 
-_BUSINESS_DEFINITIONS = """\
-## 业务类型定义
-
-- **统计业务**：对历史数据进行汇总、分析、报表生成。例如：统计收益、计算平均值、生成月度报表。
-- **规划业务**：对未来业务进行计划、排期、资源分配。例如：制定年度计划、安排项目里程碑、分配预算。
-- **投资业务**：对投资组合进行管理、分析、建议。例如：股票买卖建议、基金配置、风险评估。
+_TASK_PLANNING_RULES = """\
+## 任务分解原则
+1. 原子性：每个子任务应足够具体，可由单个 Agent 能力独立完成
+2. 完整性：所有子任务的组合必须能够完成原始任务目标
+3. 有序性：明确标注子任务之间的依赖关系和执行顺序
+4. 可验证性：每个子任务应有明确的完成标准
+5. 能力匹配：每个子任务的 required_capability 必须从上方可用能力列表中选取
 """
 
 _OUTPUT_RULES = """\
 ## 输出要求
-
 - 仔细分析用户 query，识别其中涉及的一个或多个业务意图
-- 每个任务必须包含：task_id, business, confidence, dependencies, description
-- task_id 从 task_1 开始顺序编号，如 task_1, task_2, task_3
-- dependencies 使用前置任务的 task_id 列表表示依赖关系，无依赖则为空列表 []
-- confidence 为 0.0 ~ 1.0 的浮点数，表示对该意图识别的置信度
-- 支持同时识别多个意图，每个意图对应一个独立的任务
-- 如果多个任务之间存在先后依赖关系（如规划依赖于统计数据），请在 dependencies 中正确声明
-- description 用一句话概括该任务的具体内容
+- 将每个意图拆分为可由单个 Agent 能力完成的子任务
+- 每个子任务必须包含：id, name, description, dependencies, expected_output, required_capability
+- id 从 task_1 开始顺序编号，如 task_1, task_2, task_3
+- dependencies 使用前置子任务的 id 列表表示依赖关系，无依赖则为空列表 []
+- required_capability 必须匹配上方可用能力列表中的某个 skill id
+- 如果多个子任务之间存在先后依赖关系，请在 dependencies 中正确声明
+- description 用一句话概括该子任务的具体内容
+- expected_output 说明该子任务完成后应产生的具体结果
+- 对每个子任务给出 confidence（0.0 ~ 1.0），表示对该子任务识别的置信度
 
 ## 输出格式
 
@@ -48,22 +50,64 @@ def _format_few_shots(few_shots: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def build_system_prompt(few_shots: List[Dict]) -> str:
-    """构建包含少样本示例的 system prompt。
+def _extract_capabilities(agent_cards: Sequence) -> str:
+    """从 AgentCard 列表中提取并格式化能力描述。
+
+    Args:
+        agent_cards: A2A AgentCard 对象列表，支持 dataclass 或 protobuf 风格
+
+    Returns:
+        格式化后的能力描述文本
+    """
+    capabilities: List[str] = []
+    for card in agent_cards:
+        card_name = getattr(card, "name", "未知 Agent")
+        skills = getattr(card, "skills", [])
+        for skill in skills:
+            skill_id = getattr(skill, "id", "")
+            skill_name = getattr(skill, "name", "")
+            skill_desc = getattr(skill, "description", "")
+            tags = getattr(skill, "tags", [])
+            tags_str = ", ".join(str(t) for t in tags) if tags else "无"
+            examples = getattr(skill, "examples", [])
+            examples_str = ""
+            if examples:
+                examples_str = f"\n  示例：{'; '.join(str(e) for e in examples)}"
+
+            capabilities.append(
+                f"- `{skill_id}` — {skill_name}\n"
+                f"  所属Agent：{card_name}\n"
+                f"  描述：{skill_desc}\n"
+                f"  标签：{tags_str}{examples_str}"
+            )
+
+    return "\n".join(capabilities) if capabilities else "（暂无可用 Agent 能力）"
+
+
+def build_system_prompt(
+    few_shots: List[Dict],
+    agent_cards: Sequence,
+) -> str:
+    """构建包含 AgentCard 能力列表与少样本示例的 system prompt。
 
     Args:
         few_shots: 从 RAG 检索到的相似示例列表
+        agent_cards: 可用业务 Agent 的 AgentCard 对象列表
 
     Returns:
         完整的 system prompt 文本
     """
     schema = IntentResult.model_json_schema()
     schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
+    capabilities_text = _extract_capabilities(agent_cards)
 
     parts = [
-        "你是一位多意图识别专家，负责将用户 query 解析为任务规划列表。",
+        "你是一位多意图识别与任务规划专家，负责将用户 query 解析为可执行的任务规划序列。",
         "",
-        _BUSINESS_DEFINITIONS,
+        _TASK_PLANNING_RULES,
+        "",
+        "## 可用 Agent 能力列表",
+        capabilities_text,
         "",
         _format_few_shots(few_shots),
         _OUTPUT_RULES.format(schema=schema_str),
