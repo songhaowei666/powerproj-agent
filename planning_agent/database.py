@@ -95,15 +95,15 @@ class ProjectDatabase:
     def __init__(self, db_path: str = "planning_agent/planning.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.init_tables()
-        self.seed_data()
+        self._init_tables()
+        self._seed_data()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         return conn
 
-    def init_tables(self) -> None:
+    def _init_tables(self) -> None:
         """初始化数据表。"""
         with self._connect() as conn:
             conn.executescript(
@@ -137,7 +137,7 @@ class ProjectDatabase:
             )
             conn.commit()
 
-    def seed_data(self) -> None:
+    def _seed_data(self) -> None:
         """内置种子数据。"""
         with self._connect() as conn:
             cursor = conn.execute(

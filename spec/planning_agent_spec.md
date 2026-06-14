@@ -181,9 +181,9 @@ class ProjectDatabase:
     def get_file_by_id(self, file_id: str) -> Optional[Dict]
     def delete_file_record(self, file_id: str) -> bool
     
-    # 初始化
-    def init_tables(self) -> None
-    def seed_data(self) -> None  # 内置种子数据（约10条示例电力项目）
+    # 初始化（内部方法，由构造器自动调用）
+    def _init_tables(self) -> None
+    def _seed_data(self) -> None  # 内置种子数据（约10条示例电力项目）
 ```
 
 ### 5.2 project_matcher.py
@@ -422,124 +422,184 @@ planning_agent/
 
 ## 9. 测试接口
 
-### 9.1 测试范围
+### 9.1 测试目录结构
+
+```
+planning_agent/tests/
+├── unit/                    # 单元测试：使用 Mock LLM，覆盖各模块核心逻辑
+│   ├── test_database.py
+│   ├── test_file_manager.py
+│   ├── test_project_matcher.py
+│   ├── test_graph.py
+│   ├── test_executor.py
+│   └── test_server.py       # Server 端到端测试，使用 Mock LLM
+└── functional/              # 功能测试：使用真实 LLM，默认跳过（需 RUN_FUNCTIONAL_TESTS=1）
+    └── test_server.py
+```
+
+### 9.2 测试范围
 
 | 模块 | 测试重点 | 测试文件 |
 |------|----------|----------|
-| database.py | 种子数据加载、组合查询、聚合查询、文件记录 CRUD（含覆盖） | `test_database.py` |
-| file_manager.py | 文件保存、读取、删除、下载 URL 构建 | `test_file_manager.py` |
-| project_matcher.py | 单结果匹配、无结果匹配、多结果匹配 | `test_project_matcher.py` |
-| graph.py | 意图解析、聚合查询跳过匹配、graph 编译 | `test_graph.py` |
+| database.py | 种子数据加载、组合查询、聚合查询、文件记录 CRUD（含覆盖）、边界查询 | `unit/test_database.py` |
+| file_manager.py | 文件保存、读取、删除、空目录清理、下载 URL 构建 | `unit/test_file_manager.py` |
+| project_matcher.py | 单结果匹配、无结果匹配、多结果 LLM 选择、非法编码 fallback | `unit/test_project_matcher.py` |
+| graph.py | 意图解析、聚合/明细查询、项目确认、上传/下载/删除、graph 编译、辅助函数 | `unit/test_graph.py` |
+| executor.py | 文件提取、取消任务、空消息失败、聚合完成、中断恢复、失败状态 | `unit/test_executor.py` |
+| server.py | Agent Card、SendMessage、GetTask、CancelTask、文件下载路由 | `unit/test_server.py` + `functional/test_server.py` |
 
-### 9.2 测试环境
+### 9.3 测试环境
 
 - 数据库使用临时文件，避免污染生产数据
 - 文件管理器使用临时目录，测试后自动清理
-- LLM 使用 `unittest.mock.MagicMock` + `AsyncMock` 模拟
+- 单元测试 LLM 使用 `unittest.mock.MagicMock` + `AsyncMock` 模拟
+- 功能测试使用 `providers.llm_provider.get_llm()` 真实实例，通过 `RUN_FUNCTIONAL_TESTS=1` 环境变量启用
 
-### 9.3 核心测试用例
+### 9.4 核心测试用例
 
 ```python
-# database
+# database (unit/test_database.py)
 - test_seed_data_loaded: 断言种子数据 10 条全部加载
 - test_search_by_keywords: 关键词模糊匹配
-- test_search_by_voltage_level: 电压等级筛选（如 220kv 返回 3 条）
+- test_search_by_voltage_level: 电压等级筛选
 - test_search_by_unit_code: 单位编码筛选
 - test_search_by_line_length_range: 线路长度范围筛选
+- test_search_by_substation_capacity_range: 变电容量范围筛选
 - test_search_combined_conditions: 名称 + 电压等级组合查询
 - test_aggregate_query: SUM/COUNT 聚合查询
+- test_aggregate_query_empty_result: 聚合查询无结果时的返回
 - test_file_record_cover: 同名文件覆盖（同一记录更新 file_path）
+- test_list_files_without_node_code: 不带 node_code 查询项目下所有文件
+- test_get_file_by_id / test_get_file_by_name: 文件记录查询
+- test_delete_file_record_returns_false_when_not_found: 删除不存在记录返回 False
 
-# file_manager
+# file_manager (unit/test_file_manager.py)
 - test_save_and_get_file: 保存后能通过路径读取
-- test_delete_file: 删除后文件不存在
+- test_save_overwrites_existing_file: 同名文件覆盖
+- test_delete_file_by_location: 按位置删除文件
+- test_delete_file_and_cleanup_empty_dirs: 删除后清理空目录
+- test_get_file_path_finds_existing_file / returns_none_when_empty: get_file_path 行为
 - test_build_download_url: URL 格式正确
 
-# project_matcher
+# project_matcher (unit/test_project_matcher.py)
 - test_match_single_result: 唯一结果直接返回，match_score=1.0
 - test_match_no_result: 无匹配返回 None
+- test_match_multiple_results_uses_llm_selector: 多结果时调用 LLM 选择
+- test_match_multiple_results_fallback_to_first_when_invalid_code: LLM 返回非法编码时回退到第一条
 
-# graph
-- test_parse_intent_aggregate: 聚合查询 intent=query_project，跳过 match/confirm
+# graph (unit/test_graph.py)
 - test_graph_compiles: LangGraph 编译成功
+- test_parse_intent_aggregate: 聚合查询跳过 match/confirm
+- test_parse_intent_aggregate_fallback_keywords: 聚合判断 LLM 异常时回退到关键词匹配
+- test_parse_intent_exception_fallback: parse_intent LLM 异常时 intent 回退为 unknown
+- test_parse_intent_detail_query: 明细查询的项目确认与恢复
+- test_confirm_project_negative: 用户否定项目后任务失败
+- test_confirm_project_vague_response: 用户模糊回答时 project_confirmed 保持 False
+- test_confirm_project_already_confirmed: 项目已确认时 confirm_project 直接返回
+- test_match_project_no_result: 未匹配到项目时任务失败
+- test_detail_query_project_not_found_in_db: 明细查询数据库无记录时失败
+- test_detail_query_no_matched_project: 明细查询未匹配项目时失败
+- test_upload_file_flow / test_download_file_flow / test_delete_file_flow: 文件操作完整流程
+- test_upload_file_no_matched_project / no_node_code / no_pending_files: 上传文件各类失败分支
+- test_download_file_no_matched_project / no_files: 下载文件失败/无文件分支
+- test_delete_file_no_matched_project / by_id / no_target / not_found: 删除文件各类分支
+- test_delete_file_cancelled: 删除操作用户取消
+- test_unknown_intent: 未知意图导致失败
+- test_unsupported_intent: 不支持的操作类型导致失败
+- test_finalize_no_result_text: finalize 默认结果文本
+- test_aggregate_query_drop_sql_raises / insert_sql_raises: 非法聚合 SQL 抛出 ValueError
+
+# executor (unit/test_executor.py)
+- test_extract_single_file / empty_message / skip_text_part / ignores_exception: 文件提取
+- test_cancel_sends_cancelled_message: 取消任务
+- test_execute_empty_message_fails: 空消息失败
+- test_execute_aggregate_query_completes: 聚合查询完成
+- test_execute_returns_input_required_on_interrupt: 中断恢复状态
+- test_execute_graph_interrupt_exception: ainvoke 抛出 GraphInterrupt 仍返回 input-required
+- test_execute_interrupt_info_missing_fallback: interrupt 信息缺失时使用默认提示
+- test_execute_failed_state: 失败状态处理
+
+# server (unit/test_server.py，使用 Mock LLM)
+- test_get_agent_card: Agent Card 路由
+- test_tasks_send_new_project_query / confirm_project / aggregate_query / upload_file / download_file: SendMessage 状态流转
+- test_tasks_get / test_tasks_cancel: GetTask / CancelTask
+- test_download_file / test_download_file_not_found: 文件下载路由（测试用自定义路由）
+- TestServerDownloadFile: 直接测试 planning_agent.server.download_file handler（DB 无记录 / 磁盘缺失 / 正常返回）
+
+# server (functional/test_server.py，使用真实 LLM，默认跳过)
+- test_get_agent_card
+- test_aggregate_query
+- test_project_query_and_confirm
+- test_upload_and_download_file
 ```
 
-### 9.4 A2A Server 集成测试（暂不实现代码）
+### 9.5 A2A Server 功能测试（functional/test_server.py）
 
-集成测试使用 `httpx.AsyncClient` + `pytest-asyncio` 对 Planning Agent 的 FastAPI Server 进行端到端调用。
+功能测试站在用户角度，使用真实 LLM 对 Planning Agent Server 进行端到端 JSON-RPC 调用，验证完整业务链路。
 
-#### 测试范围
+#### 测试边界
 
-| 接口 | 方法 | 测试重点 |
-|------|------|----------|
-| `/.well-known/agent.json` | GET | Agent Card 返回正确，skills 包含 project-query 和 file-management |
-| `/` (JSON-RPC tasks/send) | POST | 新任务创建、状态流转、input-required 中断恢复、completed 完成 |
-| `/` (JSON-RPC tasks/get) | POST | 根据 task_id 查询已存在的任务 |
-| `/` (JSON-RPC tasks/cancel) | POST | 取消任务后状态变为 canceled |
-| `/files/{file_id}` | GET | 文件下载路由返回正确的 FileResponse 或 404 |
+**覆盖范围：**
+- A2A Server 的 JSON-RPC 端到端调用（Agent Card、SendMessage、GetTask、CancelTask）
+- 真实 LLM 对用户自然语言的意图解析与项目匹配
+- 真实 SQLite 数据库和本地文件系统的读写
+- 核心业务场景：项目查询、聚合统计、文件上传/下载
+
+**不覆盖范围：**
+- 使用 Mock LLM 的分支场景（由单元测试覆盖）
+- 单元级别的异常处理分支（如 LLM 异常 fallback、文件不存在等）
+- 外部依赖的网络故障、并发压力、安全注入等非功能场景
 
 #### 测试环境
 
-- 使用 `fastapi.testclient.TestClient`（同步）或 `httpx.AsyncClient` + `asgi-lifespan`（异步）
-- Server 依赖的 LLM、数据库、文件管理器使用真实实例（集成测试不测 mock）
-- 每个测试用例使用独立 task_id，避免任务存储互相污染
+- 使用 `starlette.testclient.TestClient`（同步）
+- LLM 使用 `providers.llm_provider.get_llm()` 真实实例
+- 数据库和文件管理器使用临时文件/目录，每个测试独立隔离
+- 默认通过 `pytestmark = pytest.mark.skipif(...)` 跳过，避免 CI 产生意外费用；设置 `RUN_FUNCTIONAL_TESTS=1` 后启用
 
 #### 核心测试用例
 
 ```python
-# server 集成测试（test_server_integration.py）
+# functional/test_server.py
 
-- test_get_agent_card:
-    GET /.well-known/agent.json
-    断言：status_code == 200
-    断言：name == "planning-agent"
-    断言：skills 长度 >= 2
+class TestAgentCard:
+    def test_get_agent_card(self, test_client):
+        """GET /.well-known/agent-card.json 返回正确的 Agent Card。"""
+        断言：status_code == 200
+        断言：name == "planning-agent"
+        断言：skills 长度 >= 2
 
-- test_tasks_send_new_project_query:
-    POST / {jsonrpc: "2.0", method: "tasks/send", params: {message: {parts: [{text: "查一下北京西500千伏项目"}]}}}
-    断言：status_code == 200
-    断言：result.status.state == "input-required"（首次需要确认项目）
-    断言：result.status.message.parts[0].text 包含 "北京西500千伏输变电工程"
+class TestAggregateQuery:
+    def test_aggregate_query(self, test_client):
+        """聚合查询直接返回 completed，结果包含变电容量相关信息。"""
+        SendMessage: "所有项目变电容量的总和是多少"
+        断言：status.state == "TASK_STATE_COMPLETED"
+        断言：artifacts[0].parts[0].text 包含 "变电" / "容量" / "总和"
 
-- test_tasks_send_confirm_project:
-    POST / {jsonrpc: "2.0", method: "tasks/send", params: {id: "同上task_id", message: {parts: [{text: "是的"}]}}}
-    断言：result.status.state == "completed"
-    断言：result.artifacts[0].parts[0].text 包含 "PRJ001"
+class TestProjectQueryAndConfirm:
+    def test_project_query_and_confirm(self, test_client):
+        """查询项目后用户确认，返回 completed 项目详情。"""
+        第一轮 SendMessage: "查一下北京西500千伏输变电工程"
+        断言：status.state == "TASK_STATE_INPUT_REQUIRED"
+        第二轮 SendMessage（taskId=同上）: "是的"
+        断言：status.state == "TASK_STATE_COMPLETED"
+        断言：artifacts[0].parts[0].text 包含 "PRJ001" 或 "北京西"
 
-- test_tasks_send_aggregate_query:
-    POST / {jsonrpc: "2.0", method: "tasks/send", params: {message: {parts: [{text: "所有项目变电容量的总和"}]}}}
-    断言：result.status.state == "completed"
-    断言：result.artifacts[0].parts[0].text 包含 "变电容量总和"
-
-- test_tasks_send_upload_file:
-    POST / {jsonrpc: "2.0", method: "tasks/send", params: {message: {parts: [{text: "上传可研设计文件到北京西项目"}, {file: {bytes: "base64...", name: "design.pdf"}}]}}}
-    先确认项目（input-required -> 回复"是"）
-    断言最终：result.status.state == "completed"
-    断言：result.artifacts[0].parts[0].text 包含 "成功上传"
-
-- test_tasks_send_download_file:
-    POST / {jsonrpc: "2.0", method: "tasks/send", params: {message: {parts: [{text: "下载北京西项目的可研设计文件"}]}}}
-    先确认项目（input-required -> 回复"是"）
-    断言最终：result.status.state == "completed"
-    断言：artifacts 中存在 file 类型 part，uri 包含 "/files/"
-
-- test_tasks_get:
-    POST / {jsonrpc: "2.0", method: "tasks/get", params: {id: "已存在的task_id"}}
-    断言：result.id == task_id
-    断言：result.status.state 为 completed / input-required / failed 之一
-
-- test_tasks_cancel:
-    POST / {jsonrpc: "2.0", method: "tasks/cancel", params: {id: "已存在的task_id"}}
-    断言：result.status.state == "canceled"
-
-- test_download_file:
-    GET /files/{file_id}
-    断言：status_code == 200
-    断言：headers["content-disposition"] 包含文件名
-
-- test_download_file_not_found:
-    GET /files/not-exist-uuid
-    断言：status_code == 404
+class TestFileUploadAndDownload:
+    def test_upload_and_download_file(self, test_client):
+        """上传文件后经下载路由获取原文件内容。"""
+        第一轮 SendMessage（含 base64 文件）: "上传可研设计文件到北京西500千伏输变电工程"
+        断言：status.state == "TASK_STATE_INPUT_REQUIRED"
+        第二轮 SendMessage（taskId=同上）: "是的"
+        断言：status.state == "TASK_STATE_COMPLETED"
+        第三轮 SendMessage: "下载北京西500千伏输变电工程可研设计文件"
+        断言：status.state == "TASK_STATE_INPUT_REQUIRED"
+        第四轮 SendMessage（taskId=同上）: "是的"
+        断言：status.state == "TASK_STATE_COMPLETED"
+        从 artifacts 中提取 file_id
+        GET /files/{file_id}
+        断言：status_code == 200
+        断言：resp.content == 原始文件 bytes
 ```
 
 ## 10. 已确认设计决策

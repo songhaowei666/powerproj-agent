@@ -196,13 +196,15 @@ def build_planning_graph(
             f"请问是这个项目吗？请回复'是'或'否'。"
         )
         user_reply = interrupt({"question": question})
+        reply_text = str(user_reply)
 
-        if _is_positive_response(str(user_reply)):
-            state.project_confirmed = True
-        elif _is_negative_response(str(user_reply)):
+        # 优先判断否定，避免"不是"被"是"误匹配
+        if _is_negative_response(reply_text):
             state.matched_project = None
             state.status = "failed"
             state.result_text = "项目匹配失败，请重新描述您要操作的项目。"
+        elif _is_positive_response(reply_text):
+            state.project_confirmed = True
         else:
             # 模糊回答，视为需要再次确认
             state.project_confirmed = False
@@ -297,7 +299,7 @@ def build_planning_graph(
                 )
                 uploaded.append(f["name"])
 
-            node_name = _node_name(state.node_code)
+            node_name = _get_node_name(state.node_code)
             state.result_text = (
                 f"成功上传 {len(uploaded)} 个文件到「{node_name}」节点：\n"
                 + "\n".join(f"- {n}" for n in uploaded)
@@ -313,7 +315,7 @@ def build_planning_graph(
                 state.matched_project.project_code, state.node_code
             )
             if not files:
-                node_desc = f"「{_node_name(state.node_code)}」节点" if state.node_code else "所有节点"
+                node_desc = f"「{_get_node_name(state.node_code)}」节点" if state.node_code else "所有节点"
                 state.result_text = f"该项目在{node_desc}下暂无文件。"
                 return state
 
@@ -321,7 +323,7 @@ def build_planning_graph(
                 {"type": "text", "text": "为您找到以下文件："}
             ]
             for f in files:
-                node_name = _node_name(f["node_code"])
+                node_name = _get_node_name(f["node_code"])
                 artifacts.append(
                     {
                         "type": "text",
@@ -477,6 +479,6 @@ def _format_aggregate_result(result: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _node_name(code: str) -> str:
+def _get_node_name(code: str) -> str:
     names = {"001": "可研设计", "002": "可研评审", "003": "可研批复"}
     return names.get(code, code)

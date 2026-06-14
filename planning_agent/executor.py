@@ -39,15 +39,17 @@ class PlanningAgentExecutor(AgentExecutor):
             return files
         for part in message.parts:
             content_type = part.WhichOneof("content")
-            if content_type == "raw" and part.raw:
+            if content_type == "raw":
                 try:
-                    files.append(
-                        {
-                            "name": part.filename or "unnamed",
-                            "content": bytes(part.raw),
-                            "mime_type": part.media_type,
-                        }
-                    )
+                    raw_bytes = bytes(part.raw)
+                    if raw_bytes:
+                        files.append(
+                            {
+                                "name": part.filename or "unnamed",
+                                "content": raw_bytes,
+                                "mime_type": part.media_type,
+                            }
+                        )
                 except Exception:
                     pass
         return files

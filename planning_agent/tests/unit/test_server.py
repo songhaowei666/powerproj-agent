@@ -1,31 +1,32 @@
-"""A2A Server 集成测试。
+"""server.py / executor.py 单元测试。
 
-使用 Starlette TestClient 对 Planning Agent 进行端到端 JSON-RPC 调用测试。
-适配 a2a-sdk DefaultRequestHandler + AgentExecutor 模式。
+使用 Starlette TestClient 对 Planning Agent 进行端到端 JSON-RPC 调用测试，
+LLM 使用 Mock 控制返回，确保测试稳定、无外部依赖。
 """
 
 import base64
 import os
+import shutil
 import tempfile
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from starlette.routing import Route
 from starlette.responses import FileResponse, JSONResponse
+from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from a2a_base import get_a2a_app
 from planning_agent.database import ProjectDatabase
 from planning_agent.file_manager import FileManager
-from planning_agent.server import PlanningAgentExecutor, AGENT_CARD
+from planning_agent.server import AGENT_CARD, PlanningAgentExecutor, download_file
 
 
 # ---------- Mock LLM ----------
 
 
 class MockLLM:
-    """用于集成测试的可控 Mock LLM。"""
+    """用于单元测试的可控 Mock LLM。"""
 
     def __init__(self, intent_map=None):
         self._intent_map = intent_map or {}
@@ -38,14 +39,30 @@ class MockLLM:
         class StructuredLLM:
             async def ainvoke(inner_self, messages, **kwargs):
                 text = ""
-                if messages and len(messages) > 0:
-                    last = messages[-1]
-                    if hasattr(last, "content"):
-                        text = str(last.content)
-                    elif isinstance(last, tuple) and len(last) > 1:
-                        text = str(last[1])
+                system_text = ""
+                if messages:
+                    for msg in messages:
+                        if isinstance(msg, tuple) and len(msg) > 1:
+                            if msg[0] == "system":
+                                system_text = str(msg[1])
+                            else:
+                                text = str(msg[1])
+                        elif hasattr(msg, "type"):
+                            if getattr(msg, "type", None) == "system":
+                                system_text = str(getattr(msg, "content", ""))
+                            else:
+                                text = str(getattr(msg, "content", ""))
+                        elif hasattr(msg, "content"):
+                            text = str(msg.content)
 
                 if "dict" in schema_name.lower() and method == "json_mode":
+                    # 聚合判断 prompt 包含 "is_aggregate"
+                    if "is_aggregate" in system_text:
+                        if any(kw in text for kw in ("总和", "平均", "一共", "总计", "统计", "多少", "几个")):
+                            return {"is_aggregate": True}
+                        return {"is_aggregate": False}
+
+                    # 意图判断
                     for keyword, intent in self._intent_map.items():
                         if keyword in text:
                             return {"intent": intent}
@@ -90,8 +107,9 @@ def mock_llm():
 @pytest.fixture
 def test_client(mock_llm):
     """提供配置好的 TestClient，每个测试独立 DB/FM/Executor/App。"""
-    db_path = os.path.join(tempfile.mkdtemp(), "test.db")
+    db_dir = tempfile.mkdtemp()
     fm_dir = tempfile.mkdtemp()
+    db_path = os.path.join(db_dir, "test.db")
     db = ProjectDatabase(db_path=db_path)
     fm = FileManager(base_dir=fm_dir)
     executor = PlanningAgentExecutor(llm=mock_llm, db=db, fm=fm)
@@ -128,12 +146,11 @@ def test_client(mock_llm):
 
     # 清理临时文件
     os.unlink(db_path)
-    import shutil
-
+    shutil.rmtree(db_dir, ignore_errors=True)
     shutil.rmtree(fm_dir, ignore_errors=True)
 
 
-# ---------- Helper ----------
+# ---------- Helpers ----------
 
 
 def _rpc(method: str, params: dict, req_id: int = 1) -> dict:
@@ -503,3 +520,60 @@ class TestFileDownload:
         """GET /files/not-exist-uuid 返回 404。"""
         resp = test_client.get("/files/not-exist-uuid")
         assert resp.status_code == 404
+
+
+class TestServerDownloadFile:
+    """直接测试 planning_agent.server.download_file handler。"""
+
+    @pytest.mark.asyncio
+    async def test_download_file_not_in_db(self):
+        """数据库无记录时返回 404。"""
+        request = MagicMock()
+        request.path_params = {"file_id": "not-exist"}
+
+        with patch("planning_agent.server.db_instance.get_file_by_id", return_value=None):
+            resp = await download_file(request)
+            assert resp.status_code == 404
+            assert "not-exist" in resp.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_download_file_missing_on_disk(self):
+        """数据库有记录但磁盘文件不存在时返回 404。"""
+        request = MagicMock()
+        request.path_params = {"file_id": "missing-file"}
+
+        file_info = {
+            "file_id": "missing-file",
+            "file_name": "gone.pdf",
+            "file_path": "/tmp/planning_agent_tests/not_exist/gone.pdf",
+        }
+
+        with patch("planning_agent.server.db_instance.get_file_by_id", return_value=file_info):
+            resp = await download_file(request)
+            assert resp.status_code == 404
+            assert "not found on disk" in resp.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_download_file_success(self):
+        """数据库有记录且磁盘文件存在时返回 FileResponse。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = os.path.join(tmpdir, "report.pdf")
+            with open(file_path, "wb") as f:
+                f.write(b"report content")
+
+            request = MagicMock()
+            request.path_params = {"file_id": "real-file"}
+
+            file_info = {
+                "file_id": "real-file",
+                "file_name": "report.pdf",
+                "file_path": file_path,
+            }
+
+            with patch(
+                "planning_agent.server.db_instance.get_file_by_id", return_value=file_info
+            ):
+                resp = await download_file(request)
+                assert isinstance(resp, FileResponse)
+                assert resp.path == file_path
+                assert resp.filename == "report.pdf"
