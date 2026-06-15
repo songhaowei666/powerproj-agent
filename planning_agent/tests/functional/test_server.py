@@ -1,14 +1,13 @@
 """server.py 功能测试。
 
-使用真实 LLM 对 Planning Agent 进行端到端 JSON-RPC 调用测试。
+使用真实 LLM 与开发环境数据（planning_agent/planning.db、upload_files）
+对 Planning Agent 进行端到端 JSON-RPC 调用测试。
 这些测试默认跳过，需设置环境变量 RUN_FUNCTIONAL_TESTS=1 才会执行，
-因为它们会调用真实的 LLM API 并产生费用。
+因为它们会调用真实的 LLM API 并产生费用，且会读写开发环境数据库与文件。
 """
 
 import base64
 import os
-import shutil
-import tempfile
 import uuid
 
 import pytest
@@ -29,12 +28,10 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def test_client():
-    """提供使用真实 LLM 的 TestClient。"""
-    db_dir = tempfile.mkdtemp()
-    fm_dir = tempfile.mkdtemp()
-    db_path = os.path.join(db_dir, "test.db")
-    db = ProjectDatabase(db_path=db_path)
-    fm = FileManager(base_dir=fm_dir)
+    """提供使用真实 LLM 与开发环境数据库/文件目录的 TestClient。"""
+    # 与 server.py 一致，复用 planning_agent/planning.db 与 upload_files
+    db = ProjectDatabase()
+    fm = FileManager()
 
     # 使用 providers 中的真实 LLM
     from providers.llm_provider import get_llm
@@ -44,10 +41,6 @@ def test_client():
 
     with TestClient(app) as client:
         yield client
-
-    os.unlink(db_path)
-    shutil.rmtree(db_dir, ignore_errors=True)
-    shutil.rmtree(fm_dir, ignore_errors=True)
 
 
 # ---------- Helpers ----------
