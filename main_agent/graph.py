@@ -8,12 +8,18 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from intent_agent.agent import IntentAgent
 from intent_agent.models import SubTask
 from main_agent.agent_network import AgentNetwork
-from main_agent.models import MainState, TaskOutput
-from main_agent.executor import call_business_agent
+from main_agent.models import MainState, TaskOutput, InvocationTraceEntry
+from main_agent.executor import (
+    call_business_agent,
+    build_task_parts,
+    extract_artifact_text,
+    _artifact_to_message_parts,
+)
 
 
 # ---------- Prompt 模板 ----------
@@ -27,9 +33,89 @@ SUMMARIZE_SYSTEM_PROMPT = """你是一位智能助手，负责汇总多个业务
 
 输出要求：
 1. 先用一段话总体概括
-2. 然后分点说明各任务的关键结论
+2. 然后分点说明各任务的关键结论，必须包含具体数值、名称等原始数据
 3. 不要编造数据中不存在的信息
+4. 不要泛泛而谈，必须引用各任务执行结果中的实际内容
 """
+
+
+def _collect_registered_skills(agent_cards: List[Any]) -> set[str]:
+    """从 AgentCard 列表中提取已注册的 skill id。"""
+    skills: set[str] = set()
+    for card in agent_cards:
+        for skill in getattr(card, "skills", []):
+            if isinstance(skill, dict):
+                skill_id = skill.get("id", "")
+            else:
+                skill_id = getattr(skill, "id", "")
+            if skill_id:
+                skills.add(skill_id)
+    return skills
+
+
+def _serialize_agent_cards_summary(agent_cards: List[Any]) -> List[Dict[str, Any]]:
+    """将 AgentCard 序列化为轨迹展示用的简要信息。"""
+    summary: List[Dict[str, Any]] = []
+    for card in agent_cards:
+        skills: List[Dict[str, Any]] = []
+        for skill in getattr(card, "skills", []):
+            if isinstance(skill, dict):
+                skills.append(
+                    {
+                        "id": str(skill.get("id", "")),
+                        "name": str(skill.get("name", "")),
+                        "description": str(skill.get("description", "")),
+                    }
+                )
+            else:
+                skills.append(
+                    {
+                        "id": str(getattr(skill, "id", "")),
+                        "name": str(getattr(skill, "name", "")),
+                        "description": str(getattr(skill, "description", "")),
+                    }
+                )
+        summary.append(
+            {
+                "name": str(getattr(card, "name", "")),
+                "skills": skills,
+            }
+        )
+    return summary
+
+
+def _append_trace(state: MainState, entry: InvocationTraceEntry) -> None:
+    """追加一条调用轨迹。"""
+    trace_dict = entry.model_dump()
+    trace_dict["step"] = len(state.invocation_traces) + 1
+    state.invocation_traces.append(trace_dict)
+
+
+def _find_invalid_capability_subtasks(
+    subtasks: List[SubTask], registered_skills: set[str]
+) -> List[SubTask]:
+    """找出 required_capability 为空或未注册的子任务。"""
+    invalid: List[SubTask] = []
+    for subtask in subtasks:
+        capability = (subtask.required_capability or "").strip()
+        if not capability or capability not in registered_skills:
+            invalid.append(subtask)
+    return invalid
+
+
+def _collect_task_output_texts(state: MainState) -> List[str]:
+    """收集各业务 Agent 返回的原始文本结果。"""
+    texts: List[str] = []
+    for phase in state.phases:
+        for tid in phase:
+            output = state.task_outputs.get(tid)
+            if not output:
+                continue
+            for art in output.artifacts:
+                text = extract_artifact_text(art)
+                if text:
+                    texts.append(text)
+    return texts
 
 
 def _build_summarize_user_message(state: MainState) -> str:
@@ -47,8 +133,9 @@ def _build_summarize_user_message(state: MainState) -> str:
             desc = subtask.description if subtask else tid
             lines.append(f"\n【{output.required_capability} - {desc}】")
             for art in output.artifacts:
-                if art.get("type") == "text":
-                    lines.append(f"- {art.get('text', '')}")
+                text = extract_artifact_text(art)
+                if text:
+                    lines.append(f"- {text}")
 
     return "\n".join(lines)
 
@@ -65,14 +152,17 @@ def _extract_file_links(state: MainState) -> List[Dict[str, str]]:
                 continue
             subtask = subtask_map.get(tid)
             for art in output.artifacts:
-                if art.get("type") == "file" or "url" in art:
+                for part in _artifact_to_message_parts(art):
+                    url = part.get("url", "")
+                    if not url:
+                        continue
                     links.append(
                         {
                             "task_id": tid,
                             "required_capability": output.required_capability,
                             "description": subtask.description if subtask else tid,
-                            "url": art.get("url", ""),
-                            "name": art.get("name", art.get("filename", "文件")),
+                            "url": url,
+                            "name": part.get("filename") or "文件",
                         }
                     )
     return links
@@ -100,9 +190,27 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             # 缓存为空时尝试重新发现
             agent_cards = await agent_network.discover()
 
+        registered_skills = _collect_registered_skills(agent_cards)
+        capability_fix_attempts = 0
+        max_capability_fix_attempts = 2
+
         while True:
             result = await intent_agent.recognize(state.query, agent_cards)
             state.intent_result = result
+            _append_trace(
+                state,
+                InvocationTraceEntry(
+                    step=0,
+                    agent_type="intent",
+                    agent_name="意图识别 Agent",
+                    input={
+                        "query": state.query,
+                        "available_agents": _serialize_agent_cards_summary(agent_cards),
+                    },
+                    output={"intent_result": result.model_dump()},
+                    status="success",
+                ),
+            )
 
             if not result.subtasks:
                 question = (
@@ -121,6 +229,39 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 question = f"以下任务置信度较低，请补充相关信息：{descs}"
                 clarification = interrupt({"question": question})
                 state.query += f"\n补充信息：{clarification}"
+                continue
+
+            invalid_cap_tasks = _find_invalid_capability_subtasks(
+                result.subtasks, registered_skills
+            )
+            if invalid_cap_tasks:
+                if capability_fix_attempts >= max_capability_fix_attempts:
+                    descs = "、".join(
+                        [
+                            f"{t.description}（能力={t.required_capability or '空'}）"
+                            for t in invalid_cap_tasks
+                        ]
+                    )
+                    question = (
+                        f"无法为以下任务匹配 Agent 能力：{descs}。"
+                        "请补充更具体的业务意图，例如查询项目信息、统计分析或投资评估。"
+                    )
+                    clarification = interrupt({"question": question})
+                    state.query += f"\n补充信息：{clarification}"
+                    capability_fix_attempts = 0
+                    continue
+
+                invalid_desc = "、".join(
+                    [
+                        f"{t.id}({t.required_capability or '空'})"
+                        for t in invalid_cap_tasks
+                    ]
+                )
+                state.query += (
+                    f"\n系统提示：子任务 {invalid_desc} 的 required_capability 无效，"
+                    f"请从以下能力 ID 中选取：{', '.join(sorted(registered_skills))}。"
+                )
+                capability_fix_attempts += 1
                 continue
 
             break
@@ -206,12 +347,54 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         for tid, result in zip(phase_task_ids, results):
             subtask = subtask_map[tid]
             if isinstance(result, Exception):
+                _append_trace(
+                    state,
+                    InvocationTraceEntry(
+                        step=0,
+                        agent_type="business",
+                        agent_name=subtask.required_capability,
+                        capability=subtask.required_capability,
+                        phase=state.current_phase_idx,
+                        task_id=tid,
+                        input={
+                            "subtask": subtask.model_dump(),
+                            "message_parts": build_task_parts(
+                                subtask,
+                                state.task_outputs,
+                                subtask_map,
+                            ),
+                        },
+                        output={"error": str(result)},
+                        status="failed",
+                    ),
+                )
                 state.failed_task_id = tid
                 state.error_message = (
                     f"任务 {tid}（{subtask.required_capability}）执行失败（已重试3次）：{str(result)}"
                 )
                 state.status = "failed"
                 return state
+
+            trace_info = result.get("trace", {})
+            _append_trace(
+                state,
+                InvocationTraceEntry(
+                    step=0,
+                    agent_type="business",
+                    agent_name=trace_info.get("agent_name", subtask.required_capability),
+                    capability=subtask.required_capability,
+                    phase=state.current_phase_idx,
+                    task_id=tid,
+                    input={
+                        "endpoint": trace_info.get("endpoint", ""),
+                        "subtask": trace_info.get("subtask", subtask.model_dump()),
+                        "message_parts": trace_info.get("message_parts", []),
+                        "request": trace_info.get("request", {}),
+                    },
+                    output={"artifacts": result.get("artifacts", [])},
+                    status="success",
+                ),
+            )
 
             state.task_outputs[tid] = TaskOutput(
                 task_id=tid,
@@ -229,6 +412,13 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             state.final_artifacts = [
                 {"type": "text", "text": f"执行失败：{state.error_message}"}
             ]
+            if state.invocation_traces:
+                state.final_artifacts.append(
+                    {
+                        "type": "invocation_trace",
+                        "traces": list(state.invocation_traces),
+                    }
+                )
             return state
 
         # 按 Phase 顺序组织原始结果
@@ -274,6 +464,12 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             # 总结失败不影响主流程，降级为简单拼接
             summary_text = "任务执行完成。以下是各业务 Agent 的原始结果："
 
+        # 确保总结包含业务 Agent 返回的具体数据
+        raw_texts = _collect_task_output_texts(state)
+        missing_texts = [text for text in raw_texts if text and text not in summary_text]
+        if missing_texts:
+            summary_text += "\n\n" + "\n\n".join(missing_texts)
+
         # 附加文件链接引用
         if file_links:
             summary_text += "\n\n相关文件："
@@ -289,6 +485,13 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             {"type": "text", "text": summary_text}
         ]
         final_artifacts.extend(state.final_artifacts)
+        if state.invocation_traces:
+            final_artifacts.append(
+                {
+                    "type": "invocation_trace",
+                    "traces": list(state.invocation_traces),
+                }
+            )
         state.final_artifacts = final_artifacts
 
         state.status = "completed"
@@ -325,5 +528,13 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
     workflow.add_edge("finalize", "summarize")
     workflow.add_edge("summarize", END)
 
-    memory = MemorySaver()
+    memory = MemorySaver(
+        serde=JsonPlusSerializer(
+            allowed_msgpack_modules=[
+                ("intent_agent.models", "IntentResult"),
+                ("intent_agent.models", "SubTask"),
+                ("main_agent.models", "TaskOutput"),
+            ]
+        )
+    )
     return workflow.compile(checkpointer=memory)

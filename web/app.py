@@ -10,6 +10,10 @@
 """
 
 import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
 
@@ -74,6 +78,42 @@ def _render_sidebar() -> str:
     return st.session_state.base_url
 
 
+def _render_invocation_traces(traces: list[dict]) -> None:
+    """渲染意图识别与业务 Agent 的调用轨迹。"""
+    if not traces:
+        return
+
+    st.markdown("#### 调用轨迹")
+    for trace in traces:
+        agent_type = trace.get("agent_type", "")
+        agent_name = trace.get("agent_name", "未知 Agent")
+        step = trace.get("step", 0)
+        status = trace.get("status", "success")
+        status_label = "成功" if status == "success" else "失败"
+
+        if agent_type == "intent":
+            title = f"步骤 {step} | 意图识别 Agent | {status_label}"
+        else:
+            capability = trace.get("capability", "")
+            task_id = trace.get("task_id", "")
+            phase = trace.get("phase")
+            phase_text = f"Phase {phase}" if phase is not None else ""
+            title = (
+                f"步骤 {step} | 业务 Agent: {agent_name}"
+                f" | 能力: {capability} | 任务: {task_id}"
+                f" | {phase_text} | {status_label}"
+            )
+
+        with st.expander(title, expanded=False):
+            col_input, col_output = st.columns(2)
+            with col_input:
+                st.markdown("**调用参数**")
+                st.json(trace.get("input", {}))
+            with col_output:
+                st.markdown("**返回结果**")
+                st.json(trace.get("output", {}))
+
+
 def _check_service_online(base_url: str) -> bool:
     """检查主控 Agent 是否在线。"""
     client = MainAgentClient(base_url=base_url)
@@ -101,6 +141,8 @@ else:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message["role"] == "assistant" and message.get("invocation_traces"):
+            _render_invocation_traces(message["invocation_traces"])
 
 if prompt := st.chat_input("请输入您的问题，例如：帮我统计今年的投资收益并做明年规划"):
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -127,9 +169,14 @@ if prompt := st.chat_input("请输入您的问题，例如：帮我统计今年�
                         st.error(chat_resp.text)
                     else:
                         st.markdown(chat_resp.text)
+                        _render_invocation_traces(chat_resp.invocation_traces)
 
                     st.session_state.messages.append(
-                        {"role": "assistant", "content": chat_resp.text}
+                        {
+                            "role": "assistant",
+                            "content": chat_resp.text,
+                            "invocation_traces": chat_resp.invocation_traces,
+                        }
                     )
                 except Exception as exc:
                     error_text = f"请求失败：{type(exc).__name__}: {exc}"

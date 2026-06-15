@@ -1,7 +1,7 @@
 """Pydantic 模型定义。"""
 
 from typing import List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SubTask(BaseModel):
@@ -15,11 +15,20 @@ class SubTask(BaseModel):
     )
     expected_output: str = Field(..., description="预期输出描述")
     required_capability: str = Field(
-        ..., description="所需 Agent 能力类型，必须匹配某个 AgentCard Skill 的 id"
+        ..., min_length=1, description="所需 Agent 能力类型，必须匹配某个 AgentCard Skill 的 id"
     )
     confidence: float = Field(
         default=1.0, ge=0.0, le=1.0, description="置信度 0-1"
     )
+
+    @field_validator("required_capability")
+    @classmethod
+    def _validate_required_capability(cls, value: str) -> str:
+        """去除首尾空白，并拒绝空能力 ID。"""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("required_capability 不能为空")
+        return normalized
 
 
 class TaskPlan(BaseModel):

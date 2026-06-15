@@ -1,5 +1,6 @@
 """主控 Agent A2A 聊天客户端。"""
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -18,6 +19,7 @@ class ChatResponse:
     state: str
     text: str
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
+    invocation_traces: List[Dict[str, Any]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
     is_error: bool = False
 
@@ -104,16 +106,22 @@ class MainAgentClient:
             }
 
         rpc_result = rpc_body.get("result", {})
-        task_state = rpc_result.get("status", {}).get("state", "")
+        task = _extract_task_from_result(rpc_result)
+        task_state = task.get("status", {}).get("state", "")
         state_name = _normalize_task_state(task_state)
-        returned_task_id = rpc_result.get("id", task_id or "")
+        returned_task_id = task.get("id", task_id or "")
 
         return {
             "status": "passed",
             "detail": f"Task 状态: {state_name}",
-            "data": rpc_result,
+            "data": task,
             "task_id": returned_task_id,
         }
+
+
+def _extract_task_from_result(rpc_result: Dict[str, Any]) -> Dict[str, Any]:
+    """从 JSON-RPC result 中提取 Task 对象（兼容 task 嵌套与扁平两种格式）。"""
+    return rpc_result.get("task", rpc_result)
 
 
 def _normalize_task_state(task_state: Any) -> str:
@@ -138,6 +146,24 @@ def _extract_parts_text(parts: List[Dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
+def _extract_invocation_traces(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """从 artifacts 中提取调用轨迹。"""
+    traces: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        for part in artifact.get("parts", []):
+            text = part.get("text", "")
+            if not text.startswith("__INVOCATION_TRACE__\n"):
+                continue
+            payload = text[len("__INVOCATION_TRACE__\n") :]
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, list):
+                traces.extend(parsed)
+    return traces
+
+
 def parse_chat_response(result: Dict[str, Any]) -> ChatResponse:
     """将客户端原始响应解析为聊天展示结构。"""
     if result.get("status") != "passed":
@@ -158,9 +184,12 @@ def parse_chat_response(result: Dict[str, Any]) -> ChatResponse:
     text = _extract_parts_text(status_parts)
 
     artifacts = data.get("artifacts", [])
+    invocation_traces = _extract_invocation_traces(artifacts)
     artifact_texts: List[str] = []
     for artifact in artifacts:
         part_text = _extract_parts_text(artifact.get("parts", []))
+        if part_text.startswith("__INVOCATION_TRACE__\n"):
+            continue
         if part_text:
             artifact_texts.append(part_text)
 
@@ -183,6 +212,7 @@ def parse_chat_response(result: Dict[str, Any]) -> ChatResponse:
         state=state,
         text=text or "（无响应内容）",
         artifacts=artifacts,
+        invocation_traces=invocation_traces,
         raw=data,
         is_error=state == "failed",
     )

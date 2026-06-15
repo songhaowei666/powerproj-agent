@@ -6,6 +6,20 @@ from pydantic import BaseModel, Field
 from intent_agent.models import IntentResult
 
 
+class InvocationTraceEntry(BaseModel):
+    """单次 Agent 调用的轨迹记录。"""
+
+    step: int = Field(..., description="调用序号，从 1 开始")
+    agent_type: str = Field(..., description="Agent 类型：intent / business")
+    agent_name: str = Field(..., description="Agent 名称")
+    capability: Optional[str] = Field(default=None, description="业务 Agent 能力 ID")
+    phase: Optional[int] = Field(default=None, description="业务 Agent 所在执行阶段")
+    task_id: Optional[str] = Field(default=None, description="子任务 ID")
+    input: Dict[str, Any] = Field(default_factory=dict, description="调用入参")
+    output: Dict[str, Any] = Field(default_factory=dict, description="调用出参")
+    status: str = Field(default="success", description="调用状态：success / failed")
+
+
 class TaskOutput(BaseModel):
     """单个子任务的执行结果。"""
 
@@ -43,4 +57,7 @@ class MainState(BaseModel):
     )
     summary: Optional[str] = Field(
         default=None, description="LLM 生成的自然语言总结"
+    )
+    invocation_traces: List[Dict[str, Any]] = Field(
+        default_factory=list, description="意图识别与业务 Agent 的调用轨迹"
     )

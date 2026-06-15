@@ -6,7 +6,7 @@
 
 1. **Agent 网络管理**：通过 `AgentNetwork` 发现和维护下游业务 Agent，统一拉取各 Agent 的 AgentCard
 2. **意图识别**：调度意图识别 Agent，基于当前 Agent 网络中的全部 AgentCard 对 user query 进行意图解析与任务规划
-3. **置信度检查与补全循环**：当任务为空或任意子任务置信度 < 0.8 时，向用户发起澄清提问，收到补充信息后重新识别，直到满足条件
+3. **置信度检查与补全循环**：当任务为空、任意子任务置信度 < 0.8、或 `required_capability` 为空/未注册时，向用户发起澄清提问或自动重试识别，直到满足条件
 4. **分阶段并行调度**：根据子任务依赖关系构建 DAG，按拓扑分层，同层任务并行执行，层间串行
 5. **失败重试与熔断**：每个任务最多重试 3 次，任一任务最终失败即终止整个流程并返回错误
 6. 透传业务 Agent 返回的文本与文件下载链接
@@ -105,7 +105,11 @@
 
 > 客户端收到 `input-required` 后，应再次调用 `tasks/send`（相同 `id`），在 `message.parts` 中携带用户的补充信息。
 
-### 3.4 A2A 输出 (执行失败)
+### 3.5 A2A 输出 (调用轨迹 artifact)
+
+主控 Agent 在 `artifacts` 末尾附加 `invocation_trace` 类型 artifact，记录意图识别 Agent 与各业务 Agent 的调用参数与返回结果。Web 聊天页通过解析 `__INVOCATION_TRACE__` 标记的 artifact part 展示调用轨迹。
+
+### 3.6 A2A 输出 (执行失败)
 
 ```json
 {
@@ -134,6 +138,20 @@ from pydantic import BaseModel, Field
 from intent_agent.models import IntentResult, SubTask
 
 
+class InvocationTraceEntry(BaseModel):
+    """单次 Agent 调用的轨迹记录。"""
+
+    step: int
+    agent_type: str           # "intent" | "business"
+    agent_name: str
+    capability: Optional[str] = None
+    phase: Optional[int] = None
+    task_id: Optional[str] = None
+    input: Dict[str, Any] = {}
+    output: Dict[str, Any] = {}
+    status: str = "success"   # success | failed
+
+
 class TaskOutput(BaseModel):
     """单个子任务的执行结果。"""
 
@@ -158,6 +176,7 @@ class MainState(BaseModel):
     final_artifacts: List[Dict[str, Any]] = []
     status: str = "pending"             # pending | executing | completed | failed
     summary: Optional[str] = None
+    invocation_traces: List[Dict[str, Any]] = []
 ```
 
 ### 4.2 agent_network.py
@@ -233,7 +252,7 @@ async def call_business_agent(
     - 根据 subtask.required_capability 在 agent_cards 中查找匹配的 Skill
     - 通过 Skill 所属 AgentCard 的 supported_interfaces 获取 endpoint URL
     - 使用 build_task_parts 构造 message.parts（含前置依赖任务结果）
-    - 构造 tasks/send JSON-RPC 请求
+    - 构造 SendMessage JSON-RPC 请求
     - 最多重试 3 次（含指数退避）
     - 返回 {"status": "success", "artifacts": [...]}
 
@@ -255,6 +274,7 @@ class MainAgentExecutor(AgentExecutor):
 - 实现 A2A SDK 的 `AgentExecutor` 接口，由 `DefaultRequestHandler` 调用
 - 负责从 `context.message` 提取文本、调用 LangGraph
 - 会话历史直接从 A2A SDK 管理的 `task.history` 中提取，无需 Executor 自行维护
+- 首次对话时 `context.current_task` 可能为 `None`，此时回退到当前消息文本
 - 使用 `TaskUpdater` 向客户端发送 `input-required`、`completed`、`failed` 等状态
 - 将 `MainState.final_artifacts` 转换为 protobuf `Part` 列表后发送
 
@@ -353,6 +373,12 @@ async def recognize_and_check(state: MainState) -> MainState:
             question = f"以下任务置信度较低，请补充相关信息：{descs}"
             clarification = interrupt({"question": question})
             state.query += f"\n补充信息：{clarification}"
+            continue
+
+        invalid_cap_tasks = _find_invalid_capability_subtasks(result.subtasks, registered_skills)
+        if invalid_cap_tasks:
+            # 先自动追加系统提示重试识别；超过阈值后 interrupt 让用户补充
+            ...
             continue
 
         break

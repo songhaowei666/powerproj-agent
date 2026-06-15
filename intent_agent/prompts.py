@@ -50,26 +50,33 @@ def _format_few_shots(few_shots: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def _get_card_field(card: object, field: str, default: object = "") -> object:
+    """从 AgentCard 对象或序列化 dict 中读取字段。"""
+    if isinstance(card, dict):
+        return card.get(field, default)
+    return getattr(card, field, default)
+
+
 def _extract_capabilities(agent_cards: Sequence) -> str:
     """从 AgentCard 列表中提取并格式化能力描述。
 
     Args:
-        agent_cards: A2A AgentCard 对象列表，支持 dataclass 或 protobuf 风格
+        agent_cards: A2A AgentCard 对象列表或序列化 dict 列表
 
     Returns:
         格式化后的能力描述文本
     """
     capabilities: List[str] = []
     for card in agent_cards:
-        card_name = getattr(card, "name", "未知 Agent")
-        skills = getattr(card, "skills", [])
+        card_name = _get_card_field(card, "name", "未知 Agent")
+        skills = _get_card_field(card, "skills", [])
         for skill in skills:
-            skill_id = getattr(skill, "id", "")
-            skill_name = getattr(skill, "name", "")
-            skill_desc = getattr(skill, "description", "")
-            tags = getattr(skill, "tags", [])
+            skill_id = _get_card_field(skill, "id", "")
+            skill_name = _get_card_field(skill, "name", "")
+            skill_desc = _get_card_field(skill, "description", "")
+            tags = _get_card_field(skill, "tags", [])
             tags_str = ", ".join(str(t) for t in tags) if tags else "无"
-            examples = getattr(skill, "examples", [])
+            examples = _get_card_field(skill, "examples", [])
             examples_str = ""
             if examples:
                 examples_str = f"\n  示例：{'; '.join(str(e) for e in examples)}"

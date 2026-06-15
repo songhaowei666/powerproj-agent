@@ -5,12 +5,13 @@ import asyncio
 import logging
 
 import httpx
-from a2a.types import AgentCard
+from google.protobuf.json_format import ParseDict
+from a2a.types import AgentCard, a2a_pb2
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10.0
-AGENT_CARD_PATH = "/.well-known/agent.json"
+AGENT_CARD_PATH = "/.well-known/agent-card.json"
 
 
 class AgentNetwork:
@@ -74,7 +75,9 @@ class AgentNetwork:
         response = await self._client.get(f"{url}{AGENT_CARD_PATH}")
         response.raise_for_status()
         data = response.json()
-        return AgentCard(**data)
+        card = a2a_pb2.AgentCard()
+        ParseDict(data, card, ignore_unknown_fields=True)
+        return card
 
     def get_cards(self) -> List[AgentCard]:
         """返回最近一次 discover 的缓存结果。"""

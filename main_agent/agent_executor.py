@@ -4,7 +4,8 @@
 EventQueue 与客户端交互，内部通过 LangGraph 完成意图识别与任务调度。
 """
 
-from typing import Dict, List, Any
+import json
+from typing import Dict, List, Any, Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -18,6 +19,7 @@ from langgraph.errors import GraphInterrupt
 from main_agent.agent_network import AgentNetwork
 from main_agent.graph import build_main_graph
 from main_agent.models import MainState
+from main_agent.executor import extract_artifact_text
 
 
 class MainAgentExecutor(AgentExecutor):
@@ -42,20 +44,38 @@ class MainAgentExecutor(AgentExecutor):
         await updater.cancel(cancel_msg)
 
     @staticmethod
-    def _build_query_from_history(task: a2a_pb2.Task) -> str:
+    def _build_query_from_history(
+        task: Optional[a2a_pb2.Task],
+        fallback_text: str = "",
+    ) -> str:
         """从 A2A Task 的 history 中提取所有用户消息文本并拼接。
 
         A2A SDK 的 InMemoryTaskStore 会自动维护 task history，因此无需在 Executor
-        中自行维护会话状态。
+        中自行维护会话状态。首次对话时 ``context.current_task`` 可能为 None，
+        此时回退到当前消息文本。
         """
+        if task is None:
+            return fallback_text
+
         texts: List[str] = []
         for message in task.history:
-            if getattr(message, "role", None) != "user":
+            if message.role != a2a_pb2.ROLE_USER:
                 continue
             text = get_message_text(message)
             if text:
                 texts.append(text)
-        return "\n".join(texts)
+        return "\n".join(texts) if texts else fallback_text
+
+    @staticmethod
+    def _state_values_to_dict(state_values: Any) -> Dict[str, Any]:
+        """将 LangGraph checkpoint 中的状态值转为 dict。"""
+        if state_values is None:
+            return {}
+        if isinstance(state_values, dict):
+            return state_values
+        if hasattr(state_values, "model_dump"):
+            return state_values.model_dump()
+        return {}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """执行 A2A 任务。
@@ -74,12 +94,13 @@ class MainAgentExecutor(AgentExecutor):
 
         current_text = get_message_text(message) if message else ""
 
-        # SDK 要求：必须先发送一个 Task 事件，然后才能发送 TaskStatusUpdateEvent
-        initial_task = a2a_pb2.Task()
-        initial_task.id = task_id
-        initial_task.context_id = context_id
-        initial_task.status.state = a2a_pb2.TaskState.TASK_STATE_SUBMITTED
-        await event_queue.enqueue_event(initial_task)
+        # 仅首次创建 Task 时发送 SUBMITTED 事件，避免重复 task 告警
+        if task is None:
+            initial_task = a2a_pb2.Task()
+            initial_task.id = task_id
+            initial_task.context_id = context_id
+            initial_task.status.state = a2a_pb2.TaskState.TASK_STATE_SUBMITTED
+            await event_queue.enqueue_event(initial_task)
 
         if not current_text:
             updater = TaskUpdater(event_queue, task_id, context_id)
@@ -91,9 +112,10 @@ class MainAgentExecutor(AgentExecutor):
             await updater.failed(error_msg)
             return
 
-        full_query = self._build_query_from_history(task)
+        full_query = self._build_query_from_history(task, current_text)
         config = {"configurable": {"thread_id": task_id}}
         updater = TaskUpdater(event_queue, task_id, context_id)
+        invoke_result: Any = None
 
         try:
             # 检查 graph 当前状态
@@ -101,16 +123,17 @@ class MainAgentExecutor(AgentExecutor):
 
             if state and state.next:
                 # 图处于中断状态，用户发来了补充信息 -> 恢复执行
-                result = await self._graph.ainvoke(
+                invoke_result = await self._graph.ainvoke(
                     Command(resume=current_text), config
                 )
             else:
                 # 新请求
+                session_id = task.session_id if task and task.session_id else task_id
                 initial_state = MainState(
                     query=full_query,
-                    session_id=task.session_id or task_id,
+                    session_id=session_id,
                 )
-                result = await self._graph.ainvoke(initial_state, config)
+                invoke_result = await self._graph.ainvoke(initial_state, config)
         except GraphInterrupt:
             # 执行过程中触发 interrupt -> 返回 input-required
             pass
@@ -134,8 +157,10 @@ class MainAgentExecutor(AgentExecutor):
             )
             return
 
-        # 图已结束，根据结果组装响应
-        result_dict = result if isinstance(result, dict) else result.model_dump()
+        # 图已结束，优先从 checkpoint 读取完整状态（resume 后 ainvoke 返回值可能不完整）
+        result_dict = self._state_values_to_dict(state.values if state else None)
+        if not result_dict:
+            result_dict = self._state_values_to_dict(invoke_result)
         status = result_dict.get("status", "completed")
 
         if status == "failed":
@@ -155,7 +180,17 @@ class MainAgentExecutor(AgentExecutor):
             if parts:
                 await updater.add_artifact(parts=parts)
 
-        final_text = result_dict.get("summary") or "任务执行完成"
+        final_text = (result_dict.get("summary") or "").strip()
+        if not final_text:
+            artifact_texts: List[str] = []
+            for artifact in result_dict.get("final_artifacts", []):
+                if artifact.get("type") == "text" and artifact.get("text"):
+                    artifact_texts.append(artifact["text"])
+            final_text = (
+                "\n\n".join(artifact_texts)
+                if artifact_texts
+                else "未产生任何执行结果。"
+            )
         final_message = new_text_message(
             text=final_text,
             context_id=context_id,
@@ -182,12 +217,23 @@ class MainAgentExecutor(AgentExecutor):
             # 将 task_result 以文本形式展示
             lines = [f"【任务 {artifact.get('task_id', '')}】"]
             for art in artifact.get("artifacts", []):
-                if art.get("type") == "text":
-                    lines.append(art.get("text", ""))
-                elif art.get("type") == "file" or "url" in art:
-                    lines.append(f"文件：{art.get('url', '')}")
+                text = extract_artifact_text(art)
+                if text:
+                    lines.append(text)
+                    continue
+                for part in art.get("parts", []):
+                    url = part.get("url", "")
+                    if url:
+                        lines.append(f"文件：{url}")
             part = a2a_pb2.Part()
             part.text = "\n".join(lines)
+            parts.append(part)
+        elif artifact_type == "invocation_trace":
+            part = a2a_pb2.Part()
+            part.text = (
+                "__INVOCATION_TRACE__\n"
+                + json.dumps(artifact.get("traces", []), ensure_ascii=False, indent=2)
+            )
             parts.append(part)
 
         return parts

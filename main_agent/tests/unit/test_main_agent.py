@@ -4,9 +4,14 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
+from main_agent.agent_executor import MainAgentExecutor
 from main_agent.models import MainState, TaskOutput
-from main_agent.graph import build_main_graph
-from main_agent.executor import build_task_parts, call_business_agent
+from main_agent.graph import (
+    build_main_graph,
+    _collect_registered_skills,
+    _find_invalid_capability_subtasks,
+)
+from main_agent.executor import build_task_parts, call_business_agent, extract_artifact_text
 from main_agent.agent_network import AgentNetwork
 from intent_agent.models import IntentResult, SubTask
 
@@ -23,6 +28,116 @@ def mock_llm():
 def agent_network():
     """提供一个空的 AgentNetwork。"""
     return AgentNetwork()
+
+
+class TestBuildQueryFromHistory:
+    """测试从 A2A Task history 构建查询文本。"""
+
+    def test_none_task_uses_fallback(self):
+        assert MainAgentExecutor._build_query_from_history(None, "首次提问") == "首次提问"
+
+    def test_empty_history_uses_fallback(self):
+        from a2a.types import a2a_pb2
+
+        task = a2a_pb2.Task()
+        assert MainAgentExecutor._build_query_from_history(task, "当前消息") == "当前消息"
+
+    def test_joins_user_messages_from_history(self):
+        from a2a.types import a2a_pb2
+
+        task = a2a_pb2.Task()
+        user_msg = task.history.add()
+        user_msg.role = a2a_pb2.ROLE_USER
+        user_msg.parts.add().text = "第一条"
+        agent_msg = task.history.add()
+        agent_msg.role = a2a_pb2.ROLE_AGENT
+        agent_msg.parts.add().text = "回复"
+        user_msg2 = task.history.add()
+        user_msg2.role = a2a_pb2.ROLE_USER
+        user_msg2.parts.add().text = "第二条"
+
+        assert MainAgentExecutor._build_query_from_history(task) == "第一条\n第二条"
+
+    def test_state_values_to_dict(self):
+        assert MainAgentExecutor._state_values_to_dict(None) == {}
+        assert MainAgentExecutor._state_values_to_dict({"summary": "ok"}) == {
+            "summary": "ok"
+        }
+        assert MainAgentExecutor._state_values_to_dict(
+            MainState(query="q", summary="结果")
+        )["summary"] == "结果"
+
+    def test_artifact_to_parts_invocation_trace(self):
+        parts = MainAgentExecutor._artifact_to_parts(
+            {
+                "type": "invocation_trace",
+                "traces": [
+                    {
+                        "step": 1,
+                        "agent_type": "intent",
+                        "agent_name": "意图识别 Agent",
+                        "input": {"query": "测试"},
+                        "output": {},
+                        "status": "success",
+                    }
+                ],
+            }
+        )
+        assert len(parts) == 1
+        assert parts[0].text.startswith("__INVOCATION_TRACE__\n")
+
+
+class TestCapabilityValidation:
+    """测试 required_capability 校验逻辑。"""
+
+    def _build_mock_card(self, skill_id: str):
+        skill = MagicMock()
+        skill.id = skill_id
+        card = MagicMock()
+        card.skills = [skill]
+        return card
+
+    def test_collect_registered_skills(self):
+        cards = [
+            self._build_mock_card("project-query"),
+            self._build_mock_card("project-statistics"),
+        ]
+        assert _collect_registered_skills(cards) == {
+            "project-query",
+            "project-statistics",
+        }
+
+    def test_find_invalid_capability_subtasks(self):
+        subtasks = [
+            SubTask.model_construct(
+                id="task_1",
+                name="查询",
+                description="查询变电容量",
+                dependencies=[],
+                expected_output="结果",
+                required_capability="",
+            ),
+            SubTask(
+                id="task_2",
+                name="统计",
+                description="统计分析",
+                dependencies=[],
+                expected_output="结果",
+                required_capability="project-statistics",
+            ),
+            SubTask(
+                id="task_3",
+                name="未知",
+                description="未知能力",
+                dependencies=[],
+                expected_output="结果",
+                required_capability="unknown-skill",
+            ),
+        ]
+        invalid = _find_invalid_capability_subtasks(
+            subtasks, {"project-query", "project-statistics"}
+        )
+        assert [t.id for t in invalid] == ["task_1", "task_3"]
 
 
 class TestBuildPhases:
@@ -73,9 +188,32 @@ class TestBuildPhases:
 class TestMainAgentFlow:
     """测试主控 Agent 端到端流程。"""
 
+    def _build_mock_card(self, skill_id: str, url: str = "http://localhost:8001"):
+        """构造带指定 skill 的 mock AgentCard。"""
+        skill = MagicMock()
+        skill.id = skill_id
+
+        iface = MagicMock()
+        iface.protocol_binding = "JSONRPC"
+        iface.url = url
+
+        card = MagicMock()
+        card.name = f"agent-{skill_id}"
+        card.skills = [skill]
+        card.supported_interfaces = [iface]
+        skill.name = skill_id
+        skill.description = f"{skill_id} 能力"
+        return card
+
+    def _register_skills(self, agent_network: AgentNetwork, skill_ids: list[str]) -> None:
+        """向 AgentNetwork 注册测试用 AgentCard。"""
+        cards = [self._build_mock_card(skill_id) for skill_id in skill_ids]
+        agent_network._cards = cards
+
     @pytest.mark.asyncio
     async def test_full_flow_with_summarize(self, mock_llm, agent_network):
         """测试正常执行 + 总结流程。"""
+        self._register_skills(agent_network, ["data-analysis"])
         mock_llm.ainvoke = AsyncMock(
             return_value=MagicMock(content="统计结果显示收益为 10%，表现良好。")
         )
@@ -110,9 +248,30 @@ class TestMainAgentFlow:
                 return_value={
                     "status": "success",
                     "artifacts": [
-                        {"type": "text", "text": "统计结果: 收益 10%"},
-                        {"type": "file", "url": "http://example.com/report.xlsx"},
+                        {
+                            "parts": [
+                                {
+                                    "text": "【聚合查询结果】\n规划变电容量总和：13170.0"
+                                }
+                            ]
+                        }
                     ],
+                    "trace": {
+                        "agent_name": "statistics-agent",
+                        "endpoint": "http://localhost:8003",
+                        "capability": "data-analysis",
+                        "subtask": {
+                            "id": "t1",
+                            "name": "统计分析",
+                            "description": "统计分析",
+                            "dependencies": [],
+                            "expected_output": "统计结果",
+                            "required_capability": "data-analysis",
+                            "confidence": 0.95,
+                        },
+                        "message_parts": [{"text": "统计分析"}],
+                        "request": {"method": "SendMessage"},
+                    },
                 },
             ):
                 result = await graph.ainvoke(
@@ -122,16 +281,24 @@ class TestMainAgentFlow:
 
         assert result["status"] == "completed"
         assert result["summary"] is not None
-        assert "收益" in result["summary"]
-        # 检查文件链接是否被附加到总结中
-        assert "report.xlsx" in result["summary"] or "example.com" in result["summary"]
+        assert "13170.0" in result["summary"]
         # 检查原始结果也在 final_artifacts 中
         assert len(result["final_artifacts"]) >= 2  # 总结 + task_result
         assert result["final_artifacts"][0]["type"] == "text"
+        trace_artifacts = [
+            a for a in result["final_artifacts"] if a.get("type") == "invocation_trace"
+        ]
+        assert len(trace_artifacts) == 1
+        traces = trace_artifacts[0]["traces"]
+        assert len(traces) == 2
+        assert traces[0]["agent_type"] == "intent"
+        assert traces[1]["agent_type"] == "business"
+        assert traces[1]["input"]["message_parts"] == [{"text": "统计分析"}]
 
     @pytest.mark.asyncio
     async def test_interrupt_low_confidence(self, mock_llm, agent_network):
         """测试低置信度触发 interrupt。"""
+        self._register_skills(agent_network, ["skill-a"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -207,6 +374,7 @@ class TestMainAgentFlow:
     @pytest.mark.asyncio
     async def test_parallel_execution(self, mock_llm, agent_network):
         """测试同 Phase 任务并行执行。"""
+        self._register_skills(agent_network, ["skill-a", "skill-b", "skill-c"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -279,6 +447,7 @@ class TestMainAgentFlow:
     @pytest.mark.asyncio
     async def test_failure_fuse(self, mock_llm, agent_network):
         """测试任务失败熔断。"""
+        self._register_skills(agent_network, ["skill-a", "skill-b"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -328,10 +497,25 @@ class TestMainAgentFlow:
         assert "连接失败" in result["error_message"]
         # t2 不应该被执行
         assert "t2" not in result.get("task_outputs", {})
+        trace_artifacts = [
+            a for a in result["final_artifacts"] if a.get("type") == "invocation_trace"
+        ]
+        assert len(trace_artifacts) == 1
+        business_traces = [
+            t for t in trace_artifacts[0]["traces"] if t["agent_type"] == "business"
+        ]
+        assert len(business_traces) == 1
+        assert business_traces[0]["status"] == "failed"
 
 
 class TestBuildTaskParts:
     """测试前置依赖结果 parts 构建。"""
+
+    def test_extract_artifact_text_from_nested_parts(self):
+        text = extract_artifact_text(
+            {"parts": [{"text": "【聚合查询结果】\n规划变电容量总和：13170.0"}]}
+        )
+        assert "13170.0" in text
 
     def test_no_dependencies_returns_single_text_part(self):
         subtask = SubTask(
@@ -443,7 +627,14 @@ class TestExecutorRetry:
             mock_post.return_value = MagicMock(
                 raise_for_status=MagicMock(),
                 json=MagicMock(
-                    return_value={"result": {"artifacts": [{"type": "text", "text": "ok"}]}}
+                    return_value={
+                        "result": {
+                            "task": {
+                                "status": {"state": "TASK_STATE_COMPLETED"},
+                                "artifacts": [{"parts": [{"text": "ok"}]}],
+                            }
+                        }
+                    }
                 ),
             )
             result = await call_business_agent(
@@ -512,7 +703,14 @@ class TestExecutorRetry:
             mock_post.return_value = MagicMock(
                 raise_for_status=MagicMock(),
                 json=MagicMock(
-                    return_value={"result": {"artifacts": [{"type": "text", "text": "ok"}]}}
+                    return_value={
+                        "result": {
+                            "task": {
+                                "status": {"state": "TASK_STATE_COMPLETED"},
+                                "artifacts": [{"parts": [{"text": "ok"}]}],
+                            }
+                        }
+                    }
                 ),
             )
             await call_business_agent(
@@ -524,6 +722,7 @@ class TestExecutorRetry:
             )
 
         sent_payload = mock_post.call_args.kwargs["json"]
+        assert sent_payload["method"] == "SendMessage"
         parts = sent_payload["params"]["message"]["parts"]
         assert parts[0]["text"] == "基于统计结果做明年规划"
         assert any("【前置任务 t1" in p.get("text", "") for p in parts)
@@ -544,3 +743,38 @@ class TestExecutorRetry:
                 agent_cards=[self._build_mock_card("skill-a", "http://localhost:8003")],
                 session_id="s1",
             )
+
+
+class TestParseChatResponse:
+    """测试 Web 客户端响应解析。"""
+
+    def test_extract_invocation_traces(self):
+        from web.client import parse_chat_response
+
+        result = parse_chat_response(
+            {
+                "status": "passed",
+                "task_id": "task-1",
+                "data": {
+                    "id": "task-1",
+                    "status": {
+                        "state": "TASK_STATE_COMPLETED",
+                        "message": {"parts": [{"text": "总结内容"}]},
+                    },
+                    "artifacts": [
+                        {
+                            "parts": [
+                                {
+                                    "text": (
+                                        '__INVOCATION_TRACE__\n'
+                                        '[{"step": 1, "agent_type": "intent"}]'
+                                    )
+                                }
+                            ]
+                        }
+                    ],
+                },
+            }
+        )
+        assert len(result.invocation_traces) == 1
+        assert result.invocation_traces[0]["agent_type"] == "intent"

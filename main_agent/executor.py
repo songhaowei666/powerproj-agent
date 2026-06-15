@@ -2,8 +2,12 @@
 
 import asyncio
 from typing import Dict, Any, List, Optional
+from uuid import uuid4
 
+import google.protobuf.json_format as json_format
 import httpx
+from a2a.types import Role
+from a2a.types.a2a_pb2 import SendMessageConfiguration, SendMessageRequest
 
 from a2a_message_parser import build_upstream_header
 from intent_agent.models import SubTask
@@ -11,6 +15,10 @@ from main_agent.models import TaskOutput
 
 MAX_RETRIES = 3
 TIMEOUT_SECONDS = 60.0
+A2A_HEADERS = {
+    "Content-Type": "application/json",
+    "A2A-Version": "1.0",
+}
 
 
 def _find_agent_url(agent_cards: List[Any], capability: str) -> str:
@@ -38,6 +46,35 @@ def _find_agent_url(agent_cards: List[Any], capability: str) -> str:
                         url = getattr(iface, "url", "")
                         if url:
                             return url.rstrip("/")
+                raise ValueError(
+                    f"Skill '{capability}' 所属 Agent 未配置 JSONRPC endpoint"
+                )
+
+    raise ValueError(
+        f"未找到支持能力 '{capability}' 的 Agent，"
+        f"已注册能力: {[getattr(s, 'id', '') for c in agent_cards for s in getattr(c, 'skills', [])]}"
+    )
+
+
+def _find_agent_info(agent_cards: List[Any], capability: str) -> tuple[str, str]:
+    """根据 required_capability 查找 Agent 名称与 endpoint。
+
+    Returns:
+        (agent_name, endpoint_url)
+    """
+    for card in agent_cards:
+        skills = getattr(card, "skills", [])
+        for skill in skills:
+            skill_id = getattr(skill, "id", "")
+            if skill_id == capability:
+                agent_name = getattr(card, "name", capability)
+                interfaces = getattr(card, "supported_interfaces", [])
+                for iface in interfaces:
+                    binding = getattr(iface, "protocol_binding", "")
+                    if binding.upper() == "JSONRPC":
+                        url = getattr(iface, "url", "")
+                        if url:
+                            return agent_name, url.rstrip("/")
                 raise ValueError(
                     f"Skill '{capability}' 所属 Agent 未配置 JSONRPC endpoint"
                 )
@@ -88,6 +125,13 @@ def _normalize_output_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def extract_artifact_text(artifact: Dict[str, Any]) -> str:
+    """从 artifact 中提取文本（兼容 A2A parts 嵌套与内部扁平格式）。"""
+    parts = _artifact_to_message_parts(artifact)
+    texts = [part.get("text", "") for part in parts if part.get("text")]
+    return "\n".join(texts)
+
+
 def build_task_parts(
     subtask: SubTask,
     task_outputs: Dict[str, TaskOutput],
@@ -135,6 +179,59 @@ def build_task_parts(
     return parts
 
 
+def _extract_task_from_rpc_result(rpc_body: Dict[str, Any]) -> Dict[str, Any]:
+    """从 JSON-RPC 响应中提取 Task 对象。"""
+    rpc_result = rpc_body.get("result", {})
+    return rpc_result.get("task", rpc_result)
+
+
+def _extract_parts_text(parts: List[Dict[str, Any]]) -> str:
+    """从 message/artifact parts 中提取文本。"""
+    lines: List[str] = []
+    for part in parts:
+        text = part.get("text", "")
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _extract_artifacts_from_task(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从业务 Agent 返回的 Task 中提取 artifacts。"""
+    artifacts = task.get("artifacts", [])
+    if artifacts:
+        return artifacts
+
+    status_message = task.get("status", {}).get("message", {})
+    status_parts = status_message.get("parts", [])
+    text = _extract_parts_text(status_parts)
+    if text:
+        return [{"parts": [{"text": text}]}]
+    return []
+
+
+def _build_send_message_payload(message_parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """构造 A2A SendMessage JSON-RPC 请求体。"""
+    req = SendMessageRequest()
+    req.message.message_id = uuid4().hex
+    req.message.role = Role.ROLE_USER
+    for part in message_parts:
+        if part.get("text"):
+            req.message.parts.add().text = part["text"]
+            continue
+        url = part.get("url", "")
+        if url:
+            proto_part = req.message.parts.add()
+            proto_part.url = url
+            proto_part.filename = part.get("filename") or part.get("name") or "文件"
+    req.configuration.CopyFrom(SendMessageConfiguration())
+    return {
+        "jsonrpc": "2.0",
+        "method": "SendMessage",
+        "params": json_format.MessageToDict(req),
+        "id": 1,
+    }
+
+
 async def call_business_agent(
     subtask: SubTask,
     agent_cards: List[Any],
@@ -159,40 +256,50 @@ async def call_business_agent(
         Exception: 超过最大重试次数仍失败时抛出
     """
     url = _find_agent_url(agent_cards, subtask.required_capability)
+    agent_name, _ = _find_agent_info(agent_cards, subtask.required_capability)
     message_parts = build_task_parts(
         subtask,
         task_outputs or {},
         subtask_map or {subtask.id: subtask},
     )
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "tasks/send",
-        "params": {
-            "id": f"{session_id}-{subtask.id}",
-            "sessionId": session_id,
-            "message": {
-                "role": "user",
-                "parts": message_parts,
-            },
-        },
-        "id": 1,
-    }
+    payload = _build_send_message_payload(message_parts)
 
     last_error: Exception = Exception("Unknown error")
 
     for attempt in range(MAX_RETRIES):
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-                resp = await client.post(f"{url}/", json=payload)
+                resp = await client.post(
+                    f"{url}/",
+                    json=payload,
+                    headers=A2A_HEADERS,
+                )
                 resp.raise_for_status()
                 data = resp.json()
 
                 if "error" in data:
                     raise RuntimeError(f"Agent JSON-RPC error: {data['error']}")
 
-                result_task = data.get("result", {})
-                artifacts = result_task.get("artifacts", [])
-                return {"status": "success", "artifacts": artifacts}
+                task = _extract_task_from_rpc_result(data)
+                task_state = task.get("status", {}).get("state", "")
+                if task_state == "TASK_STATE_FAILED":
+                    status_parts = task.get("status", {}).get("message", {}).get("parts", [])
+                    error_text = _extract_parts_text(status_parts) or "业务 Agent 执行失败"
+                    raise RuntimeError(error_text)
+
+                artifacts = _extract_artifacts_from_task(task)
+                return {
+                    "status": "success",
+                    "artifacts": artifacts,
+                    "trace": {
+                        "agent_name": agent_name,
+                        "endpoint": url,
+                        "capability": subtask.required_capability,
+                        "subtask": subtask.model_dump(),
+                        "message_parts": message_parts,
+                        "request": payload,
+                    },
+                }
 
         except Exception as e:
             last_error = e

@@ -36,7 +36,10 @@ def _build_planning_card() -> AgentCard:
                 name="项目信息查询",
                 description="根据自然语言查询电力项目基本信息及聚合统计",
                 tags=["planning", "project", "query"],
-                examples=["查一下北京西500千伏项目的信息"],
+                examples=[
+                    "查一下北京西500千伏项目的信息",
+                    "所有项目变电容量的总和是多少",
+                ],
             ),
             AgentSkill(
                 id="file-management",
@@ -133,6 +136,38 @@ async def test_recognize_multi_agent_query():
     available_skills = {s.id for card in agent_cards for s in card.skills}
     for subtask in result.subtasks:
         assert subtask.required_capability in available_skills
+
+    order_index = {tid: idx for idx, tid in enumerate(result.execution_order)}
+    for subtask in result.subtasks:
+        for dep in subtask.dependencies:
+            assert dep in order_index
+            assert order_index[dep] < order_index[subtask.id]
+
+
+@pytest.mark.skipif(not _has_llm_config(), reason="未配置 LLM 环境变量")
+async def test_recognize_all_projects_capacity_query(capsys):
+    """测试全量项目规划变电容量聚合统计 query 的意图识别。"""
+    agent = IntentAgent(get_llm())
+    agent_cards = [_build_planning_card(), _build_statistics_card()]
+    query = "所有项目的规划变电容量是多少"
+
+    result = await agent.recognize(query, agent_cards=agent_cards)
+
+    print("\n===== 意图识别结果 =====")
+    print(result.model_dump_json(indent=2, ensure_ascii=False))
+    print("========================\n")
+
+    assert result.task_goal
+    assert result.subtasks
+    assert result.execution_order
+    assert result.reasoning
+
+    available_skills = {s.id for card in agent_cards for s in card.skills}
+    for subtask in result.subtasks:
+        assert subtask.required_capability in available_skills
+        assert subtask.name
+        assert subtask.description
+        assert subtask.expected_output
 
     order_index = {tid: idx for idx, tid in enumerate(result.execution_order)}
     for subtask in result.subtasks:

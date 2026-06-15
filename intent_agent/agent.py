@@ -1,11 +1,35 @@
 """IntentAgent 封装类，对外统一入口。"""
 
-from typing import Sequence
+from typing import Any, Dict, List, Sequence
 
 from langchain_core.language_models import BaseChatModel
 
 from intent_agent.graph import build_intent_graph
 from intent_agent.models import IntentResult
+
+
+def _serialize_agent_cards(agent_cards: Sequence) -> List[Dict[str, Any]]:
+    """将 AgentCard 转为可序列化 dict，供 LangGraph checkpoint 使用。"""
+    serialized: List[Dict[str, Any]] = []
+    for card in agent_cards:
+        skills: List[Dict[str, Any]] = []
+        for skill in getattr(card, "skills", []):
+            skills.append(
+                {
+                    "id": getattr(skill, "id", ""),
+                    "name": getattr(skill, "name", ""),
+                    "description": getattr(skill, "description", ""),
+                    "tags": list(getattr(skill, "tags", [])),
+                    "examples": list(getattr(skill, "examples", [])),
+                }
+            )
+        serialized.append(
+            {
+                "name": getattr(card, "name", ""),
+                "skills": skills,
+            }
+        )
+    return serialized
 
 
 class IntentAgent:
@@ -37,6 +61,9 @@ class IntentAgent:
             IntentResult，包含任务目标、子任务列表、执行顺序和推理说明
         """
         state = await self._graph.ainvoke(
-            {"query": query, "agent_cards": agent_cards}
+            {
+                "query": query,
+                "agent_cards": _serialize_agent_cards(agent_cards),
+            }
         )
         return state["result"]
