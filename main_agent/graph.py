@@ -191,7 +191,15 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 state.error_message = f"任务 {tid} 未找到对应的 SubTask"
                 state.status = "failed"
                 return state
-            coros.append(call_business_agent(subtask, agent_cards, session_id))
+            coros.append(
+                call_business_agent(
+                    subtask,
+                    agent_cards,
+                    session_id,
+                    task_outputs=state.task_outputs,
+                    subtask_map=subtask_map,
+                )
+            )
 
         results = await asyncio.gather(*coros, return_exceptions=True)
 

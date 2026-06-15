@@ -112,6 +112,16 @@ def _is_negative_response(text: str) -> bool:
 
 # ---------- Graph Builder ----------
 
+def _build_intent_input(state: PlanningState) -> str:
+    """构建意图识别输入，附带可选上游上下文。"""
+    if not state.upstream_context:
+        return state.query
+    return (
+        f"当前任务：{state.query}\n\n"
+        f"上游任务输出：\n{state.upstream_context}"
+    )
+
+
 def build_planning_graph(
     llm: BaseChatModel,
     db: ProjectDatabase,
@@ -133,7 +143,7 @@ def build_planning_graph(
                     ("system", INTENT_SYSTEM_PROMPT),
                     (
                         "human",
-                        f'请解析以下用户输入的意图，返回 JSON {{"intent": "意图类型"}}：\n{state.query}',
+                        f'请解析以下用户输入的意图，返回 JSON {{"intent": "意图类型"}}：\n{_build_intent_input(state)}',
                     ),
                 ]
             )

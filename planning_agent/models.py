@@ -21,7 +21,10 @@ class MatchedProject(BaseModel):
 class PlanningState(BaseModel):
     """Planning Agent LangGraph 状态。"""
 
-    query: str = Field(default="", description="当前完整查询文本（含补充信息）")
+    query: str = Field(default="", description="当前任务描述（不含前置任务上下文）")
+    upstream_context: str = Field(
+        default="", description="主控注入的前置任务输出上下文"
+    )
     intent: str = Field(
         default="unknown",
         description="操作类型：query_project / upload_file / download_file / delete_file / unknown",

@@ -12,6 +12,8 @@ from a2a.server.tasks import TaskUpdater
 from a2a.types import a2a_pb2
 from a2a.helpers import new_text_message, get_message_text
 
+from a2a_message_parser import format_upstream_context, parse_message_parts
+
 from providers.llm_provider import get_llm
 from planning_agent.database import ProjectDatabase
 from planning_agent.file_manager import FileManager
@@ -32,27 +34,21 @@ class PlanningAgentExecutor(AgentExecutor):
         self._graph = build_planning_graph(self._llm, self._db, self._fm)
 
     @staticmethod
-    def _extract_files_from_message(message) -> List[Dict[str, Any]]:
-        """从 protobuf Message 中提取上传的文件。"""
-        files = []
-        if message is None:
-            return files
-        for part in message.parts:
-            content_type = part.WhichOneof("content")
-            if content_type == "raw":
-                try:
-                    raw_bytes = bytes(part.raw)
-                    if raw_bytes:
-                        files.append(
-                            {
-                                "name": part.filename or "unnamed",
-                                "content": raw_bytes,
-                                "mime_type": part.media_type,
-                            }
-                        )
-                except Exception:
-                    pass
-        return files
+    def _build_pending_files(parsed_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """将解析出的 raw 文件转为 PlanningState 可序列化的结构。"""
+        pending_files: List[Dict[str, Any]] = []
+        for item in parsed_files:
+            content = item.get("content")
+            if isinstance(content, bytes):
+                content = base64.b64encode(content).decode()
+            pending_files.append(
+                {
+                    "name": item.get("name") or "unnamed",
+                    "content": content,
+                    "mime_type": item.get("mime_type", ""),
+                }
+            )
+        return pending_files
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """取消任务。"""
@@ -81,13 +77,12 @@ class PlanningAgentExecutor(AgentExecutor):
         task_id = context.task_id
         context_id = context.context_id
 
-        current_text = get_message_text(message) if message else ""
-        pending_files = self._extract_files_from_message(message)
-
-        # 将 bytes 转为 base64 字符串，避免 checkpointer 序列化失败
-        for f in pending_files:
-            if isinstance(f.get("content"), bytes):
-                f["content"] = base64.b64encode(f["content"]).decode()
+        parsed = parse_message_parts(message)
+        current_text = parsed.task_query or (
+            get_message_text(message) if message else ""
+        )
+        pending_files = self._build_pending_files(parsed.raw_files)
+        upstream_context = format_upstream_context(parsed)
 
         # SDK 要求：必须先发送一个 Task 事件，然后才能发送 TaskStatusUpdateEvent
         initial_task = a2a_pb2.Task()
@@ -126,6 +121,7 @@ class PlanningAgentExecutor(AgentExecutor):
                 # 新请求
                 initial_state = PlanningState(
                     query=current_text,
+                    upstream_context=upstream_context,
                     pending_files=pending_files,
                 )
                 result = await self._graph.ainvoke(initial_state, config)

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 from main_agent.models import MainState, TaskOutput
 from main_agent.graph import build_main_graph
-from main_agent.executor import call_business_agent
+from main_agent.executor import build_task_parts, call_business_agent
 from main_agent.agent_network import AgentNetwork
 from intent_agent.models import IntentResult, SubTask
 
@@ -246,9 +246,13 @@ class TestMainAgentFlow:
 
         call_order = []
 
-        async def mock_call(subtask, agent_cards, session_id):
+        async def mock_call(subtask, agent_cards, session_id, task_outputs=None, subtask_map=None):
             call_order.append(subtask.id)
             await asyncio.sleep(0.05)  # 模拟网络延迟
+            if subtask.id == "t3":
+                assert task_outputs is not None
+                assert "t1" in task_outputs
+                assert "t2" in task_outputs
             return {
                 "status": "success",
                 "artifacts": [{"type": "text", "text": f"结果-{subtask.id}"}],
@@ -303,7 +307,7 @@ class TestMainAgentFlow:
             reasoning="测试熔断",
         )
 
-        async def mock_call(subtask, agent_cards, session_id):
+        async def mock_call(subtask, agent_cards, session_id, task_outputs=None, subtask_map=None):
             if subtask.id == "t1":
                 raise RuntimeError("连接失败")
             return {"status": "success", "artifacts": []}
@@ -324,6 +328,96 @@ class TestMainAgentFlow:
         assert "连接失败" in result["error_message"]
         # t2 不应该被执行
         assert "t2" not in result.get("task_outputs", {})
+
+
+class TestBuildTaskParts:
+    """测试前置依赖结果 parts 构建。"""
+
+    def test_no_dependencies_returns_single_text_part(self):
+        subtask = SubTask(
+            id="t1",
+            name="统计",
+            description="统计今年收益",
+            dependencies=[],
+            expected_output="结果",
+            required_capability="skill-a",
+        )
+        parts = build_task_parts(subtask, {}, {"t1": subtask})
+        assert parts == [{"text": "统计今年收益"}]
+
+    def test_with_dependency_outputs(self):
+        t1 = SubTask(
+            id="t1",
+            name="统计",
+            description="统计今年收益",
+            dependencies=[],
+            expected_output="结果A",
+            required_capability="skill-a",
+        )
+        t2 = SubTask(
+            id="t2",
+            name="规划",
+            description="基于统计结果做明年规划",
+            dependencies=["t1"],
+            expected_output="结果B",
+            required_capability="skill-b",
+        )
+        task_outputs = {
+            "t1": TaskOutput(
+                task_id="t1",
+                required_capability="skill-a",
+                status="success",
+                artifacts=[{"type": "text", "text": "收益 10%"}],
+            )
+        }
+        parts = build_task_parts(t2, task_outputs, {"t1": t1, "t2": t2})
+
+        assert parts[0] == {"text": "基于统计结果做明年规划"}
+        assert parts[1]["text"].startswith("【前置任务 t1")
+        assert {"text": "任务描述：统计今年收益"} in parts
+        assert {"text": "收益 10%"} in parts
+
+    def test_with_a2a_nested_artifact_parts(self):
+        t1 = SubTask(
+            id="t1",
+            name="统计",
+            description="统计",
+            dependencies=[],
+            expected_output="结果",
+            required_capability="skill-a",
+        )
+        t2 = SubTask(
+            id="t2",
+            name="规划",
+            description="做规划",
+            dependencies=["t1"],
+            expected_output="结果",
+            required_capability="skill-b",
+        )
+        task_outputs = {
+            "t1": TaskOutput(
+                task_id="t1",
+                required_capability="skill-a",
+                status="success",
+                artifacts=[
+                    {
+                        "parts": [
+                            {"text": "统计完成"},
+                            {
+                                "url": "http://localhost:8001/files/1",
+                                "filename": "report.pdf",
+                            },
+                        ]
+                    }
+                ],
+            )
+        }
+        parts = build_task_parts(t2, task_outputs, {"t1": t1, "t2": t2})
+        assert {"text": "统计完成"} in parts
+        assert {
+            "url": "http://localhost:8001/files/1",
+            "filename": "report.pdf",
+        } in parts
 
 
 class TestExecutorRetry:
@@ -385,6 +479,55 @@ class TestExecutorRetry:
                     session_id="s1",
                 )
             assert mock_post.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_message_includes_dependency_outputs(self):
+        """有依赖时，请求 payload 应包含前置任务结果。"""
+        t1 = SubTask(
+            id="t1",
+            name="统计",
+            description="统计今年收益",
+            dependencies=[],
+            expected_output="结果A",
+            required_capability="skill-a",
+        )
+        t2 = SubTask(
+            id="t2",
+            name="规划",
+            description="基于统计结果做明年规划",
+            dependencies=["t1"],
+            expected_output="结果B",
+            required_capability="skill-b",
+        )
+        task_outputs = {
+            "t1": TaskOutput(
+                task_id="t1",
+                required_capability="skill-a",
+                status="success",
+                artifacts=[{"type": "text", "text": "收益 10%"}],
+            )
+        }
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = MagicMock(
+                raise_for_status=MagicMock(),
+                json=MagicMock(
+                    return_value={"result": {"artifacts": [{"type": "text", "text": "ok"}]}}
+                ),
+            )
+            await call_business_agent(
+                t2,
+                agent_cards=[self._build_mock_card("skill-b", "http://localhost:8001")],
+                session_id="s1",
+                task_outputs=task_outputs,
+                subtask_map={"t1": t1, "t2": t2},
+            )
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        parts = sent_payload["params"]["message"]["parts"]
+        assert parts[0]["text"] == "基于统计结果做明年规划"
+        assert any("【前置任务 t1" in p.get("text", "") for p in parts)
+        assert any(p.get("text") == "收益 10%" for p in parts)
 
     @pytest.mark.asyncio
     async def test_capability_not_found(self):

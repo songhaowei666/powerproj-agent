@@ -207,10 +207,24 @@ DEFAULT_AGENT_URLS: List[str] = [
 ### 4.4 executor.py
 
 ```python
+def build_task_parts(
+    subtask: SubTask,
+    task_outputs: Dict[str, TaskOutput],
+    subtask_map: Dict[str, SubTask],
+) -> List[Dict[str, Any]]:
+    """
+    构建发送给业务 Agent 的 message.parts。
+
+    - 第一个 part：当前任务 text
+    - 每个前置依赖：标题 text + 任务描述 text + 原始 artifact parts（text/url）
+    """
+
 async def call_business_agent(
     subtask: SubTask,
     agent_cards: List[AgentCard],
     session_id: str,
+    task_outputs: Optional[Dict[str, TaskOutput]] = None,
+    subtask_map: Optional[Dict[str, SubTask]] = None,
 ) -> Dict[str, Any]:
     """
     调用下游业务 Agent 的 A2A JSON-RPC 接口。
@@ -218,6 +232,7 @@ async def call_business_agent(
     内部行为：
     - 根据 subtask.required_capability 在 agent_cards 中查找匹配的 Skill
     - 通过 Skill 所属 AgentCard 的 supported_interfaces 获取 endpoint URL
+    - 使用 build_task_parts 构造 message.parts（含前置依赖任务结果）
     - 构造 tasks/send JSON-RPC 请求
     - 最多重试 3 次（含指数退避）
     - 返回 {"status": "success", "artifacts": [...]}
@@ -360,11 +375,29 @@ async def recognize_and_check(state: MainState) -> MainState:
 
 1. 取出 `state.phases[state.current_phase_idx]` 中的 subtask id 列表
 2. 通过 id 查找到对应的 `SubTask`
-3. 使用 `asyncio.gather(*coros, return_exceptions=True)` 并行调用所有业务 Agent
-4. 遍历结果：
+3. 从 `state.task_outputs` 收集当前任务 `dependencies` 对应的前置结果
+4. 使用 `asyncio.gather(*coros, return_exceptions=True)` 并行调用所有业务 Agent
+5. 遍历结果：
    - 成功：写入 `state.task_outputs[tid]`
    - 失败（任意一个）：设置 `state.failed_task_id`、`state.error_message`、`state.status = "failed"`，立即返回
-5. 全部成功：`state.current_phase_idx += 1`
+6. 全部成功：`state.current_phase_idx += 1`
+
+后置任务的 `message.parts` 由 `build_task_parts` 生成，格式示例：
+
+```json
+[
+  {"text": "基于统计结果做明年规划"},
+  {"text": "【前置任务 t1 - skill-a - 统计】"},
+  {"text": "任务描述：统计今年收益"},
+  {"text": "收益 10%"},
+  {"url": "http://localhost:8001/files/1", "filename": "report.pdf"}
+]
+```
+
+下游 Agent 通过 `a2a_message_parser.parse_message_parts` 解析：
+- 第一个 text part → `task_query`（当前任务）
+- `【前置任务` 开头的 text part → 前置分段
+- raw part → 用户上传文件
 
 #### finalize
 
@@ -398,7 +431,13 @@ def route_after_execution(state: MainState) -> str:
 
 ```python
 coros = [
-    call_business_agent(subtask_map[tid], agent_cards, session_id)
+    call_business_agent(
+        subtask_map[tid],
+        agent_cards,
+        session_id,
+        task_outputs=state.task_outputs,
+        subtask_map=subtask_map,
+    )
     for tid in phase_task_ids
 ]
 results = await asyncio.gather(*coros, return_exceptions=True)
@@ -406,7 +445,7 @@ results = await asyncio.gather(*coros, return_exceptions=True)
 
 ### 6.2 Phase 间串行
 
-不同 Phase 之间存在依赖（如 Phase 1 的输出是 Phase 2 的输入），必须等待前一 Phase 全部完成后才能进入下一 Phase。
+不同 Phase 之间存在依赖（如 Phase 1 的输出是 Phase 2 的输入），必须等待前一 Phase 全部完成后才能进入下一 Phase。进入下一 Phase 时，会将已完成的前置任务 `artifacts` 注入后置任务的 A2A 请求消息中。
 
 ## 7. AgentNetwork 发现策略
 

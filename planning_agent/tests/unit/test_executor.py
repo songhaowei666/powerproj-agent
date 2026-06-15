@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from a2a_message_parser import ParsedInput, parse_message_parts
 from planning_agent.executor import PlanningAgentExecutor
 from planning_agent.models import PlanningState
 
@@ -22,11 +23,11 @@ def executor(mock_llm):
     return PlanningAgentExecutor(llm=mock_llm)
 
 
-class TestExtractFilesFromMessage:
-    """测试 _extract_files_from_message。"""
+class TestBuildPendingFiles:
+    """测试 raw 文件解析与转换。"""
 
-    def test_extract_single_file(self, executor):
-        """正常提取一个文件。"""
+    def test_build_pending_files_from_parsed(self, executor):
+        """通过共享解析器提取 raw 文件。"""
         message = MagicMock()
         part = MagicMock()
         part.WhichOneof.return_value = "raw"
@@ -35,45 +36,15 @@ class TestExtractFilesFromMessage:
         part.media_type = "application/pdf"
         message.parts = [part]
 
-        files = executor._extract_files_from_message(message)
+        parsed = parse_message_parts(message)
+        files = executor._build_pending_files(parsed.raw_files)
         assert len(files) == 1
         assert files[0]["name"] == "test.pdf"
-        assert files[0]["content"] == b"file content"
         assert files[0]["mime_type"] == "application/pdf"
+        assert isinstance(files[0]["content"], str)
 
-    def test_extract_empty_message(self, executor):
-        """空 message 返回空列表。"""
-        assert executor._extract_files_from_message(None) == []
-
-    def test_extract_skip_text_part(self, executor):
-        """跳过非 raw 类型的 part。"""
-        message = MagicMock()
-        text_part = MagicMock()
-        text_part.WhichOneof.return_value = "text"
-        raw_part = MagicMock()
-        raw_part.WhichOneof.return_value = "raw"
-        raw_part.raw = b"content"
-        raw_part.filename = "file.txt"
-        raw_part.media_type = "text/plain"
-        message.parts = [text_part, raw_part]
-
-        files = executor._extract_files_from_message(message)
-        assert len(files) == 1
-        assert files[0]["name"] == "file.txt"
-
-    def test_extract_ignores_exception(self, executor):
-        """提取单个文件异常时跳过该文件。"""
-        message = MagicMock()
-        part = MagicMock()
-        part.WhichOneof.return_value = "raw"
-        part.raw = b"content"
-        # bytes(part.raw) 会抛出异常
-        type(part).raw = property(lambda self: (_ for _ in ()).throw(Exception("raw error")))
-        part.filename = "bad.pdf"
-        message.parts = [part]
-
-        files = executor._extract_files_from_message(message)
-        assert files == []
+    def test_build_pending_files_empty(self, executor):
+        assert executor._build_pending_files([]) == []
 
 
 class TestCancel:
@@ -122,14 +93,10 @@ class TestExecute:
 
             # 模拟 get_message_text 返回空字符串且无文件
             with patch(
-                "planning_agent.executor.get_message_text", return_value=""
+                "planning_agent.executor.parse_message_parts",
+                return_value=ParsedInput(task_query="", raw_files=[]),
             ):
-                with patch.object(
-                    executor,
-                    "_extract_files_from_message",
-                    return_value=[],
-                ):
-                    await executor.execute(context, event_queue)
+                await executor.execute(context, event_queue)
 
             mock_updater.failed.assert_awaited_once()
 

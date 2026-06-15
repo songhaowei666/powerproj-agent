@@ -16,6 +16,7 @@ from a2a.types import (
 )
 from a2a.helpers import new_text_message, new_task_from_user_message, get_message_text
 
+from a2a_message_parser import parse_message_parts
 from planning_agent.database import ProjectDatabase
 
 
@@ -144,7 +145,10 @@ class InvestmentAgentExecutor(AgentExecutor):
         updater = TaskUpdater(event_queue, task.id, task.context_id)
 
         try:
-            text = get_message_text(context.message) if context.message else ""
+            parsed = parse_message_parts(context.message)
+            text = parsed.task_query or (
+                get_message_text(context.message) if context.message else ""
+            )
             project = _find_project(self._db, text)
 
             if not project:
