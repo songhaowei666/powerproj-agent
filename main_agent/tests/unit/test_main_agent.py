@@ -745,6 +745,43 @@ class TestExecutorRetry:
         return card
 
     @pytest.mark.asyncio
+    async def test_first_call_does_not_send_task_id(self):
+        """首次调用不传 task_id，由业务 Agent 创建任务。"""
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = MagicMock(
+                raise_for_status=MagicMock(),
+                json=MagicMock(
+                    return_value={
+                        "result": {
+                            "task": {
+                                "id": "server-assigned-id",
+                                "status": {"state": "TASK_STATE_COMPLETED"},
+                                "artifacts": [{"parts": [{"text": "ok"}]}],
+                            }
+                        }
+                    }
+                ),
+            )
+            result = await call_business_agent(
+                SubTask(
+                    id="t1",
+                    name="测试",
+                    description="测试",
+                    dependencies=[],
+                    expected_output="ok",
+                    required_capability="skill-a",
+                ),
+                agent_cards=[self._build_mock_card("skill-a", "http://localhost:8001")],
+                session_id="s1",
+            )
+            assert result["status"] == "success"
+            assert result["business_task_id"] == "server-assigned-id"
+            sent_payload = mock_post.call_args.kwargs["json"]
+            message = sent_payload["params"]["message"]
+            assert "taskId" not in message
+            assert "task_id" not in message
+
+    @pytest.mark.asyncio
     async def test_success_on_first_attempt(self):
         with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
             mock_post.return_value = MagicMock(

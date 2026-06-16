@@ -287,16 +287,22 @@ async def call_business_agent(
     """
     url = _find_agent_url(agent_cards, subtask.required_capability)
     agent_name, _ = _find_agent_info(agent_cards, subtask.required_capability)
-    active_business_task_id = business_task_id or uuid4().hex
     if resume_text is not None:
+        if not business_task_id:
+            raise ValueError(
+                f"恢复业务 Agent 任务 {subtask.id} 时缺少 business_task_id"
+            )
         message_parts = [{"text": resume_text}]
+        request_task_id = business_task_id
     else:
         message_parts = build_task_parts(
             subtask,
             task_outputs or {},
             subtask_map or {subtask.id: subtask},
         )
-    payload = _build_send_message_payload(message_parts, active_business_task_id)
+        # 首次调用不传 task_id，由业务 Agent 创建任务；续聊时才携带已有 id
+        request_task_id = business_task_id
+    payload = _build_send_message_payload(message_parts, request_task_id)
 
     last_error: Exception = Exception("Unknown error")
 
@@ -315,7 +321,7 @@ async def call_business_agent(
                     raise RuntimeError(f"Agent JSON-RPC error: {data['error']}")
 
                 task = _extract_task_from_rpc_result(data)
-                returned_task_id = task.get("id") or active_business_task_id
+                returned_task_id = task.get("id") or business_task_id or ""
                 task_state = task.get("status", {}).get("state", "")
                 status_parts = _extract_status_parts(task)
 
