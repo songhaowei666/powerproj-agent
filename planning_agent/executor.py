@@ -12,7 +12,11 @@ from a2a.server.tasks import TaskUpdater
 from a2a.types import a2a_pb2
 from a2a.helpers import new_text_message, get_message_text
 
-from a2a_message_parser import format_upstream_context, parse_message_parts
+from a2a_message_parser import (
+    build_agent_message_from_parts,
+    format_upstream_context,
+    parse_message_parts,
+)
 
 from providers.llm_provider import get_llm
 from planning_agent.database import ProjectDatabase
@@ -135,14 +139,21 @@ class PlanningAgentExecutor(AgentExecutor):
             try:
                 interrupt_info = graph_state.tasks[0].interrupts[0].value
                 question = interrupt_info.get("question", "请补充信息")
+                parts = interrupt_info.get("parts") or []
             except (IndexError, AttributeError):
                 question = "请补充更多信息"
+                parts = []
 
-            status_message = new_text_message(
-                text=question,
-                context_id=context_id,
-                task_id=task_id,
-            )
+            if parts:
+                status_message = build_agent_message_from_parts(
+                    parts, context_id, task_id
+                )
+            else:
+                status_message = new_text_message(
+                    text=question,
+                    context_id=context_id,
+                    task_id=task_id,
+                )
             await updater.update_status(
                 a2a_pb2.TaskState.TASK_STATE_INPUT_REQUIRED, status_message
             )

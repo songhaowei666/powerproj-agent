@@ -122,12 +122,29 @@ class PlanningState(BaseModel):
     "state": "input-required",
     "message": {
       "role": "agent",
-      "parts": [{"type": "text", "text": "找到最匹配的项目：\n名称：北京西500千伏输变电工程\n编码：PRJ001\n线路长度：120km\n变电容量：1000MVA\n\n请问是这个项目吗？请回复'是'或'否'。"}]
+      "parts": [
+        {
+          "text": "找到最匹配的项目：\n名称：北京西500千伏输变电工程\n编码：PRJ001\n...\n\n请问是这个项目吗？"
+        },
+        {
+          "mediaType": "application/vnd.powerproj.confirmation+json",
+          "data": {
+            "type": "confirmation",
+            "action": "project_confirm",
+            "title": "请确认项目",
+            "options": [
+              {"id": "yes", "label": "是", "replyText": "是"},
+              {"id": "no", "label": "否", "replyText": "否"}
+            ]
+          }
+        }
+      ]
     }
-  },
-  "artifacts": [{"type": "text", "text": "..."}]
+  }
 }
 ```
+
+> Web 客户端根据 `data.options` 渲染按钮；用户点击后发送 `replyText` 作为 text part 恢复任务。删除确认使用 `action=delete_confirm`，选项为「确认删除 / 取消」。
 
 ### 4.3 A2A 输出 (查询结果)
 

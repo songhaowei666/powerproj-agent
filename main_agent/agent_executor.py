@@ -4,8 +4,9 @@
 EventQueue 与客户端交互，内部通过 LangGraph 完成意图识别与任务调度。
 """
 
+import asyncio
 import json
-from typing import Dict, List, Any, Optional
+from typing import Awaitable, Callable, Dict, List, Any, Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -16,10 +17,76 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.types import Command
 from langgraph.errors import GraphInterrupt
 
+from a2a_message_parser import build_agent_message_from_parts
 from main_agent.agent_network import AgentNetwork
 from main_agent.graph import build_main_graph
 from main_agent.models import MainState
 from main_agent.executor import extract_artifact_text
+from main_agent.streaming import format_summary_chunk_message, format_trace_step_message
+
+
+TracePublisher = Callable[[Dict[str, Any]], Awaitable[None]]
+SummaryChunkPublisher = Callable[[str], Awaitable[None]]
+
+
+class _StreamPublisher:
+    """将 LangGraph 内部事件转为 A2A WORKING 状态流式推送。"""
+
+    def __init__(
+        self,
+        updater: TaskUpdater,
+        context_id: str,
+        task_id: str,
+    ) -> None:
+        self._updater = updater
+        self._context_id = context_id
+        self._task_id = task_id
+        self._lock = asyncio.Lock()
+        self._working_sent = False
+
+    async def _ensure_working(self) -> None:
+        if self._working_sent:
+            return
+        working_message = new_text_message(
+            text="正在处理您的请求...",
+            context_id=self._context_id,
+            task_id=self._task_id,
+        )
+        await self._updater.update_status(
+            a2a_pb2.TaskState.TASK_STATE_WORKING,
+            working_message,
+        )
+        self._working_sent = True
+
+    async def publish_trace(self, trace_dict: Dict[str, Any]) -> None:
+        """推送单条调用轨迹。"""
+        async with self._lock:
+            await self._ensure_working()
+            trace_message = new_text_message(
+                text=format_trace_step_message(trace_dict),
+                context_id=self._context_id,
+                task_id=self._task_id,
+            )
+            await self._updater.update_status(
+                a2a_pb2.TaskState.TASK_STATE_WORKING,
+                trace_message,
+            )
+
+    async def publish_summary_chunk(self, chunk: str) -> None:
+        """推送总结文本分块。"""
+        if not chunk:
+            return
+        async with self._lock:
+            await self._ensure_working()
+            chunk_message = new_text_message(
+                text=format_summary_chunk_message(chunk),
+                context_id=self._context_id,
+                task_id=self._task_id,
+            )
+            await self._updater.update_status(
+                a2a_pb2.TaskState.TASK_STATE_WORKING,
+                chunk_message,
+            )
 
 
 class MainAgentExecutor(AgentExecutor):
@@ -77,6 +144,20 @@ class MainAgentExecutor(AgentExecutor):
             return state_values.model_dump()
         return {}
 
+    @staticmethod
+    def _build_graph_config(
+        task_id: str,
+        stream_publisher: _StreamPublisher,
+    ) -> Dict[str, Any]:
+        """构建 LangGraph 运行配置，注入流式推送回调。"""
+        return {
+            "configurable": {
+                "thread_id": task_id,
+                "publish_trace": stream_publisher.publish_trace,
+                "publish_summary_chunk": stream_publisher.publish_summary_chunk,
+            }
+        }
+
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """执行 A2A 任务。
 
@@ -113,8 +194,9 @@ class MainAgentExecutor(AgentExecutor):
             return
 
         full_query = self._build_query_from_history(task, current_text)
-        config = {"configurable": {"thread_id": task_id}}
         updater = TaskUpdater(event_queue, task_id, context_id)
+        stream_publisher = _StreamPublisher(updater, context_id, task_id)
+        config = self._build_graph_config(task_id, stream_publisher)
         invoke_result: Any = None
 
         try:
@@ -144,14 +226,21 @@ class MainAgentExecutor(AgentExecutor):
             try:
                 interrupt_info = state.tasks[0].interrupts[0].value
                 question = interrupt_info.get("question", "请补充信息")
+                parts = interrupt_info.get("parts") or []
             except (IndexError, AttributeError):
                 question = "请补充更多信息"
+                parts = []
 
-            status_message = new_text_message(
-                text=question,
-                context_id=context_id,
-                task_id=task_id,
-            )
+            if parts:
+                status_message = build_agent_message_from_parts(
+                    parts, context_id, task_id
+                )
+            else:
+                status_message = new_text_message(
+                    text=question,
+                    context_id=context_id,
+                    task_id=task_id,
+                )
             await updater.update_status(
                 a2a_pb2.TaskState.TASK_STATE_INPUT_REQUIRED, status_message
             )
@@ -165,6 +254,17 @@ class MainAgentExecutor(AgentExecutor):
 
         if status == "failed":
             error_msg = result_dict.get("error_message", "未知错误")
+            # 失败路径保留完整轨迹 artifact，供非流式客户端兜底
+            failed_traces = result_dict.get("invocation_traces", [])
+            if failed_traces:
+                trace_parts = self._artifact_to_parts(
+                    {
+                        "type": "invocation_trace",
+                        "traces": failed_traces,
+                    }
+                )
+                if trace_parts:
+                    await updater.add_artifact(parts=trace_parts)
             error_message = new_text_message(
                 text=error_msg,
                 context_id=context_id,
@@ -173,9 +273,11 @@ class MainAgentExecutor(AgentExecutor):
             await updater.failed(error_message)
             return
 
-        # 发送 artifacts
+        # 发送 artifacts（成功路径不再推送 invocation_trace，轨迹已在 WORKING 阶段流式发送）
         final_artifacts = result_dict.get("final_artifacts", [])
         for artifact in final_artifacts:
+            if artifact.get("type") == "invocation_trace":
+                continue
             parts = self._artifact_to_parts(artifact)
             if parts:
                 await updater.add_artifact(parts=parts)

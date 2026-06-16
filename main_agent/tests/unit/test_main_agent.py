@@ -10,17 +10,24 @@ from main_agent.graph import (
     build_main_graph,
     _collect_registered_skills,
     _find_invalid_capability_subtasks,
+    _resolve_clarification_prompt,
 )
 from main_agent.executor import build_task_parts, call_business_agent, extract_artifact_text
 from main_agent.agent_network import AgentNetwork
+from main_agent.streaming import format_trace_step_message, parse_trace_step_message
 from intent_agent.models import IntentResult, SubTask
 
 
 @pytest.fixture
 def mock_llm():
     """提供一个 mock LLM。"""
+
+    async def _mock_astream(*_args, **_kwargs):
+        yield MagicMock(content="总结内容")
+
     llm = MagicMock()
     llm.ainvoke = AsyncMock(return_value=MagicMock(content="总结内容"))
+    llm.astream = _mock_astream
     return llm
 
 
@@ -85,6 +92,41 @@ class TestBuildQueryFromHistory:
         )
         assert len(parts) == 1
         assert parts[0].text.startswith("__INVOCATION_TRACE__\n")
+
+
+class TestStreamingProtocol:
+    """测试流式轨迹协议编解码。"""
+
+    def test_trace_step_roundtrip(self):
+        trace = {"step": 1, "agent_type": "intent", "status": "success"}
+        message = format_trace_step_message(trace)
+        parsed = parse_trace_step_message(message)
+        assert parsed == trace
+
+
+class TestClarificationPrompt:
+    """测试澄清问句解析。"""
+
+    def test_resolve_clarification_uses_llm_output(self):
+        result = IntentResult(
+            is_business_query=True,
+            task_goal="模糊请求",
+            subtasks=[],
+            execution_order=[],
+            reasoning="测试",
+            clarification_prompt="请问您想查询哪个项目？",
+        )
+        assert _resolve_clarification_prompt(result, "默认澄清") == "请问您想查询哪个项目？"
+
+    def test_resolve_clarification_fallback(self):
+        result = IntentResult(
+            is_business_query=True,
+            task_goal="模糊请求",
+            subtasks=[],
+            execution_order=[],
+            reasoning="测试",
+        )
+        assert _resolve_clarification_prompt(result, "默认澄清") == "默认澄清"
 
 
 class TestCapabilityValidation:
@@ -285,15 +327,80 @@ class TestMainAgentFlow:
         # 检查原始结果也在 final_artifacts 中
         assert len(result["final_artifacts"]) >= 2  # 总结 + task_result
         assert result["final_artifacts"][0]["type"] == "text"
+        # 成功路径轨迹不再写入 final_artifacts，改由流式 WORKING 推送
         trace_artifacts = [
             a for a in result["final_artifacts"] if a.get("type") == "invocation_trace"
         ]
-        assert len(trace_artifacts) == 1
-        traces = trace_artifacts[0]["traces"]
-        assert len(traces) == 2
-        assert traces[0]["agent_type"] == "intent"
-        assert traces[1]["agent_type"] == "business"
-        assert traces[1]["input"]["message_parts"] == [{"text": "统计分析"}]
+        assert len(trace_artifacts) == 0
+        assert len(result["invocation_traces"]) == 2
+        assert result["invocation_traces"][0]["agent_type"] == "intent"
+        assert result["invocation_traces"][1]["agent_type"] == "business"
+        assert result["invocation_traces"][1]["input"]["message_parts"] == [{"text": "统计分析"}]
+
+    @pytest.mark.asyncio
+    async def test_direct_reply_non_business(self, mock_llm, agent_network):
+        """非业务 query 应直接 LLM 回复，不调度业务 Agent。"""
+        self._register_skills(agent_network, ["skill-a"])
+        graph = build_main_graph(mock_llm, agent_network)
+
+        intent_result = IntentResult(
+            is_business_query=False,
+            task_goal="用户问候",
+            subtasks=[],
+            execution_order=[],
+            reasoning="用户仅发送问候语",
+        )
+
+        with patch(
+            "intent_agent.agent.IntentAgent.recognize",
+            new_callable=AsyncMock,
+            return_value=intent_result,
+        ):
+            with patch(
+                "main_agent.graph.call_business_agent",
+                new_callable=AsyncMock,
+            ) as mock_call:
+                result = await graph.ainvoke(
+                    MainState(query="你好"),
+                    {"configurable": {"thread_id": "test-greet"}},
+                )
+
+        assert result["status"] == "completed"
+        assert result["summary"] == "总结内容"
+        assert len(result["invocation_traces"]) == 1
+        mock_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_uses_clarification_prompt(self, mock_llm, agent_network):
+        """业务 query 模糊时应优先使用 LLM 输出的 clarification_prompt。"""
+        self._register_skills(agent_network, ["skill-a"])
+        graph = build_main_graph(mock_llm, agent_network)
+
+        intent_result = IntentResult(
+            is_business_query=True,
+            task_goal="模糊请求",
+            subtasks=[],
+            execution_order=[],
+            reasoning="测试",
+            clarification_prompt="请问您想查询、统计还是规划哪类业务？",
+        )
+
+        with patch(
+            "intent_agent.agent.IntentAgent.recognize",
+            new_callable=AsyncMock,
+            return_value=intent_result,
+        ):
+            result = await graph.ainvoke(
+                MainState(query="帮我弄一下"),
+                {"configurable": {"thread_id": "test-clarify"}},
+            )
+
+        assert "__interrupt__" in result
+        interrupt_info = result["__interrupt__"][0]
+        assert (
+            interrupt_info.value["question"]
+            == "请问您想查询、统计还是规划哪类业务？"
+        )
 
     @pytest.mark.asyncio
     async def test_interrupt_low_confidence(self, mock_llm, agent_network):
@@ -302,6 +409,7 @@ class TestMainAgentFlow:
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
+            is_business_query=True,
             task_goal="模糊请求",
             subtasks=[
                 SubTask(
@@ -335,6 +443,7 @@ class TestMainAgentFlow:
 
         # 模拟恢复：用户补充信息后重新识别（此时置信度足够）
         intent_result_ok = IntentResult(
+            is_business_query=True,
             task_goal="统计收益",
             subtasks=[
                 SubTask(
@@ -414,7 +523,14 @@ class TestMainAgentFlow:
 
         call_order = []
 
-        async def mock_call(subtask, agent_cards, session_id, task_outputs=None, subtask_map=None):
+        async def mock_call(
+            subtask,
+            agent_cards,
+            session_id,
+            task_outputs=None,
+            subtask_map=None,
+            **kwargs,
+        ):
             call_order.append(subtask.id)
             await asyncio.sleep(0.05)  # 模拟网络延迟
             if subtask.id == "t3":
@@ -476,7 +592,14 @@ class TestMainAgentFlow:
             reasoning="测试熔断",
         )
 
-        async def mock_call(subtask, agent_cards, session_id, task_outputs=None, subtask_map=None):
+        async def mock_call(
+            subtask,
+            agent_cards,
+            session_id,
+            task_outputs=None,
+            subtask_map=None,
+            **kwargs,
+        ):
             if subtask.id == "t1":
                 raise RuntimeError("连接失败")
             return {"status": "success", "artifacts": []}
@@ -729,6 +852,93 @@ class TestExecutorRetry:
         assert any(p.get("text") == "收益 10%" for p in parts)
 
     @pytest.mark.asyncio
+    async def test_input_required_response(self):
+        confirmation_parts = [
+            {"text": "请问是这个项目吗？"},
+            {
+                "mediaType": "application/vnd.powerproj.confirmation+json",
+                "data": {
+                    "type": "confirmation",
+                    "action": "project_confirm",
+                    "options": [
+                        {"id": "yes", "label": "是", "replyText": "是"},
+                        {"id": "no", "label": "否", "replyText": "否"},
+                    ],
+                },
+            },
+        ]
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = MagicMock(
+                raise_for_status=MagicMock(),
+                json=MagicMock(
+                    return_value={
+                        "result": {
+                            "task": {
+                                "id": "biz-task-1",
+                                "status": {
+                                    "state": "TASK_STATE_INPUT_REQUIRED",
+                                    "message": {"parts": confirmation_parts},
+                                },
+                            }
+                        }
+                    }
+                ),
+            )
+            result = await call_business_agent(
+                SubTask(
+                    id="t1",
+                    name="测试",
+                    description="测试",
+                    dependencies=[],
+                    expected_output="ok",
+                    required_capability="skill-a",
+                ),
+                agent_cards=[self._build_mock_card("skill-a", "http://localhost:8001")],
+                session_id="s1",
+            )
+            assert result["status"] == "input_required"
+            assert result["business_task_id"] == "biz-task-1"
+            assert result["parts"] == confirmation_parts
+            assert mock_post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_resume_sends_task_id_and_reply_text(self):
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = MagicMock(
+                raise_for_status=MagicMock(),
+                json=MagicMock(
+                    return_value={
+                        "result": {
+                            "task": {
+                                "id": "biz-task-1",
+                                "status": {"state": "TASK_STATE_COMPLETED"},
+                                "artifacts": [{"parts": [{"text": "ok"}]}],
+                            }
+                        }
+                    }
+                ),
+            )
+            await call_business_agent(
+                SubTask(
+                    id="t1",
+                    name="测试",
+                    description="测试",
+                    dependencies=[],
+                    expected_output="ok",
+                    required_capability="skill-a",
+                ),
+                agent_cards=[self._build_mock_card("skill-a", "http://localhost:8001")],
+                session_id="s1",
+                business_task_id="biz-task-1",
+                resume_text="是",
+            )
+            sent_payload = mock_post.call_args.kwargs["json"]
+            message = sent_payload["params"]["message"]
+            assert message["taskId"] == "biz-task-1" or message.get("task_id") == "biz-task-1"
+            parts = message["parts"]
+            assert parts[0]["text"] == "是"
+
+    @pytest.mark.asyncio
     async def test_capability_not_found(self):
         with pytest.raises(ValueError, match="未找到支持能力"):
             await call_business_agent(
@@ -778,3 +988,31 @@ class TestParseChatResponse:
         )
         assert len(result.invocation_traces) == 1
         assert result.invocation_traces[0]["agent_type"] == "intent"
+
+    def test_parse_confirmation_from_input_required(self):
+        from a2a_message_parser.confirmation import build_confirmation_parts
+        from web.client import parse_chat_response
+
+        parts = build_confirmation_parts(
+            text="请问是这个项目吗？",
+            action="project_confirm",
+        )
+        result = parse_chat_response(
+            {
+                "status": "passed",
+                "task_id": "task-confirm",
+                "data": {
+                    "id": "task-confirm",
+                    "status": {
+                        "state": "TASK_STATE_INPUT_REQUIRED",
+                        "message": {"parts": parts},
+                    },
+                    "artifacts": [],
+                },
+            }
+        )
+        assert result.state == "input-required"
+        assert result.confirmation is not None
+        assert result.confirmation.action == "project_confirm"
+        assert len(result.confirmation.options) == 2
+        assert "请在下方输入补充信息" not in result.text

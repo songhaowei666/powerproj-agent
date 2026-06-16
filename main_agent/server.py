@@ -29,7 +29,7 @@ AGENT_CARD = AgentCard(
     name="main-agent",
     description="主控 Agent，用户请求的统一入口，负责任务调度与 orchestration",
     version="1.0.0",
-    capabilities=AgentCapabilities(streaming=False),
+    capabilities=AgentCapabilities(streaming=True),
     default_input_modes=["text"],
     default_output_modes=["text"],
     skills=[

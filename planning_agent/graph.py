@@ -12,6 +12,10 @@ from langgraph.checkpoint.memory import MemorySaver
 from planning_agent.database import ProjectDatabase
 from planning_agent.file_manager import FileManager
 from planning_agent.models import PlanningState
+from a2a_message_parser import (
+    DELETE_CONFIRM_OPTIONS,
+    build_confirmation_parts,
+)
 from planning_agent.project_matcher import ProjectMatcher
 
 
@@ -195,17 +199,32 @@ def build_planning_graph(
             return state
 
         proj = state.matched_project
-        question = (
+        text_body = (
             f"找到最匹配的项目：\n"
             f"名称：{proj.project_name}\n"
             f"编码：{proj.project_code}\n"
             f"电压等级：{proj.voltage_level or '未填写'}\n"
             f"单位编码：{proj.unit_code or '未填写'}\n"
             f"线路长度：{proj.line_length}km\n"
-            f"变电容量：{proj.substation_capacity}MVA\n\n"
-            f"请问是这个项目吗？请回复'是'或'否'。"
+            f"变电容量：{proj.substation_capacity}MVA"
         )
-        user_reply = interrupt({"question": question})
+        question = f"{text_body}\n\n请问是这个项目吗？"
+        confirmation_parts = build_confirmation_parts(
+            text=question,
+            action="project_confirm",
+            title="请确认项目",
+            body={
+                "projectName": proj.project_name,
+                "projectCode": proj.project_code,
+                "voltageLevel": proj.voltage_level or "",
+            },
+        )
+        user_reply = interrupt(
+            {
+                "question": question,
+                "parts": confirmation_parts,
+            }
+        )
         reply_text = str(user_reply)
 
         # 优先判断否定，避免"不是"被"是"误匹配
@@ -363,8 +382,22 @@ def build_planning_graph(
             # 二次确认
             if not state.delete_confirmed:
                 file_name = state.target_file_name or "该文件"
-                question = f"确认删除文件「{file_name}」吗？该操作不可恢复，请回复'确认删除'或'取消'。"
-                user_reply = interrupt({"question": question})
+                question = (
+                    f"确认删除文件「{file_name}」吗？该操作不可恢复。"
+                )
+                confirmation_parts = build_confirmation_parts(
+                    text=question,
+                    action="delete_confirm",
+                    title="确认删除",
+                    options=DELETE_CONFIRM_OPTIONS,
+                    body={"fileName": file_name},
+                )
+                user_reply = interrupt(
+                    {
+                        "question": question,
+                        "parts": confirmation_parts,
+                    }
+                )
                 if "确认删除" in str(user_reply):
                     state.delete_confirmed = True
                 else:

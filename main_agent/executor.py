@@ -209,9 +209,34 @@ def _extract_artifacts_from_task(task: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def _build_send_message_payload(message_parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_task_state(task_state: Any) -> str:
+    """将 A2A Task 状态规范化为简短名称。"""
+    if not isinstance(task_state, str):
+        return str(task_state)
+    return task_state.replace("TASK_STATE_", "").lower().replace("_", "-")
+
+
+def _is_input_required_state(task_state: Any) -> bool:
+    """判断业务 Agent 是否返回 input-required。"""
+    normalized = _normalize_task_state(task_state)
+    return normalized in ("input-required", "inputrequired")
+
+
+def _extract_status_parts(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从 Task 状态消息中提取 parts 字典列表。"""
+    status_message = task.get("status", {}).get("message", {})
+    parts = status_message.get("parts", [])
+    return parts if isinstance(parts, list) else []
+
+
+def _build_send_message_payload(
+    message_parts: List[Dict[str, Any]],
+    business_task_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """构造 A2A SendMessage JSON-RPC 请求体。"""
     req = SendMessageRequest()
+    if business_task_id:
+        req.message.task_id = business_task_id
     req.message.message_id = uuid4().hex
     req.message.role = Role.ROLE_USER
     for part in message_parts:
@@ -238,6 +263,8 @@ async def call_business_agent(
     session_id: str,
     task_outputs: Optional[Dict[str, TaskOutput]] = None,
     subtask_map: Optional[Dict[str, SubTask]] = None,
+    business_task_id: Optional[str] = None,
+    resume_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """调用下游业务 Agent 的 A2A JSON-RPC 接口。
 
@@ -247,9 +274,12 @@ async def call_business_agent(
         session_id: 会话ID
         task_outputs: 已完成任务输出，用于向有依赖的后置任务注入前置结果
         subtask_map: 全部子任务定义，用于构建前置结果上下文
+        business_task_id: 业务 Agent 侧 task_id，resume 时复用
+        resume_text: 用户补充/确认文本，非空时仅发送该文本
 
     Returns:
-        {"status": "success", "artifacts": [...]}
+        success: {"status": "success", "artifacts": [...]}
+        input_required: {"status": "input_required", "question", "parts", "business_task_id"}
 
     Raises:
         ValueError: 找不到匹配 Agent 或 endpoint 时
@@ -257,12 +287,16 @@ async def call_business_agent(
     """
     url = _find_agent_url(agent_cards, subtask.required_capability)
     agent_name, _ = _find_agent_info(agent_cards, subtask.required_capability)
-    message_parts = build_task_parts(
-        subtask,
-        task_outputs or {},
-        subtask_map or {subtask.id: subtask},
-    )
-    payload = _build_send_message_payload(message_parts)
+    active_business_task_id = business_task_id or uuid4().hex
+    if resume_text is not None:
+        message_parts = [{"text": resume_text}]
+    else:
+        message_parts = build_task_parts(
+            subtask,
+            task_outputs or {},
+            subtask_map or {subtask.id: subtask},
+        )
+    payload = _build_send_message_payload(message_parts, active_business_task_id)
 
     last_error: Exception = Exception("Unknown error")
 
@@ -281,16 +315,36 @@ async def call_business_agent(
                     raise RuntimeError(f"Agent JSON-RPC error: {data['error']}")
 
                 task = _extract_task_from_rpc_result(data)
+                returned_task_id = task.get("id") or active_business_task_id
                 task_state = task.get("status", {}).get("state", "")
+                status_parts = _extract_status_parts(task)
+
                 if task_state == "TASK_STATE_FAILED":
-                    status_parts = task.get("status", {}).get("message", {}).get("parts", [])
                     error_text = _extract_parts_text(status_parts) or "业务 Agent 执行失败"
                     raise RuntimeError(error_text)
+
+                if _is_input_required_state(task_state):
+                    question = _extract_parts_text(status_parts) or "请补充信息"
+                    return {
+                        "status": "input_required",
+                        "question": question,
+                        "parts": status_parts,
+                        "business_task_id": returned_task_id,
+                        "trace": {
+                            "agent_name": agent_name,
+                            "endpoint": url,
+                            "capability": subtask.required_capability,
+                            "subtask": subtask.model_dump(),
+                            "message_parts": message_parts,
+                            "request": payload,
+                        },
+                    }
 
                 artifacts = _extract_artifacts_from_task(task)
                 return {
                     "status": "success",
                     "artifacts": artifacts,
+                    "business_task_id": returned_task_id,
                     "trace": {
                         "agent_name": agent_name,
                         "endpoint": url,

@@ -2,16 +2,17 @@
 
 import asyncio
 from collections import deque
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Awaitable, Callable, Optional
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from intent_agent.agent import IntentAgent
-from intent_agent.models import SubTask
+from intent_agent.models import IntentResult, SubTask
 from main_agent.agent_network import AgentNetwork
 from main_agent.models import MainState, TaskOutput, InvocationTraceEntry
 from main_agent.executor import (
@@ -38,10 +39,24 @@ SUMMARIZE_SYSTEM_PROMPT = """你是一位智能助手，负责汇总多个业务
 4. 不要泛泛而谈，必须引用各任务执行结果中的实际内容
 """
 
+DIRECT_REPLY_SYSTEM_PROMPT = """你是一位电网智能助手，负责与用户进行友好、简洁的对话。
+
+当用户发送问候、闲聊或与具体电网业务无关的内容时，请自然、礼貌地回复：
+- 语气友好、专业，使用第一人称"我"
+- 回复简洁，1~3 段即可
+- 可简要介绍你能提供的业务能力（如项目信息查询、统计分析、规划、投资评估等），引导用户提出具体业务需求
+- 不要编造业务数据，不要假装已经执行了查询或分析任务
+"""
+
+DEFAULT_CLARIFICATION_VAGUE = (
+    "您的请求不够明确，请补充更多细节，"
+    "例如您想查询、统计、规划还是投资？具体涉及哪些时间范围或项目？"
+)
+
 
 def _collect_registered_skills(agent_cards: List[Any]) -> set[str]:
     """从 AgentCard 列表中提取已注册的 skill id。"""
-    skills: set[str] = set()
+    skills: set[str] = set[str]()
     for card in agent_cards:
         for skill in getattr(card, "skills", []):
             if isinstance(skill, dict):
@@ -84,11 +99,79 @@ def _serialize_agent_cards_summary(agent_cards: List[Any]) -> List[Dict[str, Any
     return summary
 
 
-def _append_trace(state: MainState, entry: InvocationTraceEntry) -> None:
-    """追加一条调用轨迹。"""
+TracePublisher = Callable[[Dict[str, Any]], Awaitable[None]]
+SummaryChunkPublisher = Callable[[str], Awaitable[None]]
+
+
+def _get_trace_publisher(config: Optional[RunnableConfig]) -> Optional[TracePublisher]:
+    """从 LangGraph config 中获取调用轨迹流式推送回调。"""
+    if not config:
+        return None
+    configurable = config.get("configurable") or {}
+    publisher = configurable.get("publish_trace")
+    return publisher if callable(publisher) else None
+
+
+def _get_summary_publisher(
+    config: Optional[RunnableConfig],
+) -> Optional[SummaryChunkPublisher]:
+    """从 LangGraph config 中获取总结分块流式推送回调。"""
+    if not config:
+        return None
+    configurable = config.get("configurable") or {}
+    publisher = configurable.get("publish_summary_chunk")
+    return publisher if callable(publisher) else None
+
+
+async def _record_trace(
+    state: MainState,
+    entry: InvocationTraceEntry,
+    config: Optional[RunnableConfig] = None,
+) -> None:
+    """追加一条调用轨迹，并在流式模式下实时推送。"""
     trace_dict = entry.model_dump()
     trace_dict["step"] = len(state.invocation_traces) + 1
     state.invocation_traces.append(trace_dict)
+    publisher = _get_trace_publisher(config)
+    if publisher is not None:
+        await publisher(trace_dict)
+
+
+def _resolve_clarification_prompt(result: IntentResult, fallback: str) -> str:
+    """优先使用意图识别 LLM 输出的澄清问句，否则回退到默认模板。"""
+    prompt = (result.clarification_prompt or "").strip()
+    return prompt or fallback
+
+
+async def _stream_llm_text(
+    llm: BaseChatModel,
+    messages: List[tuple[str, str]],
+    summary_publisher: Optional[SummaryChunkPublisher],
+) -> str:
+    """流式调用 LLM 生成文本，并在有 publisher 时逐块推送。"""
+    summary_text = ""
+    streamed_any = False
+    try:
+        async for chunk in llm.astream(messages):
+            chunk_text = str(getattr(chunk, "content", chunk))
+            if not chunk_text:
+                continue
+            streamed_any = True
+            summary_text += chunk_text
+            if summary_publisher is not None:
+                await summary_publisher(chunk_text)
+    except Exception:
+        summary_text = ""
+
+    if not streamed_any:
+        try:
+            response = await llm.ainvoke(messages)
+            summary_text = str(response.content)
+            if summary_publisher is not None and summary_text:
+                await summary_publisher(summary_text)
+        except Exception:
+            summary_text = ""
+    return summary_text
 
 
 def _find_invalid_capability_subtasks(
@@ -183,7 +266,9 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
     """
     intent_agent = IntentAgent(llm)
 
-    async def recognize_and_check(state: MainState) -> MainState:
+    async def recognize_and_check(
+        state: MainState, config: RunnableConfig
+    ) -> MainState:
         """调用意图识别，检查置信度，不足时 interrupt 等待用户补充。"""
         agent_cards = agent_network.get_cards()
         if not agent_cards:
@@ -197,7 +282,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         while True:
             result = await intent_agent.recognize(state.query, agent_cards)
             state.intent_result = result
-            _append_trace(
+            await _record_trace(
                 state,
                 InvocationTraceEntry(
                     step=0,
@@ -210,12 +295,15 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                     output={"intent_result": result.model_dump()},
                     status="success",
                 ),
+                config,
             )
 
+            if not result.is_business_query:
+                return state
+
             if not result.subtasks:
-                question = (
-                    "您的请求不够明确，请补充更多细节，"
-                    "例如您想查询、统计、规划还是投资？具体涉及哪些时间范围或项目？"
+                question = _resolve_clarification_prompt(
+                    result, DEFAULT_CLARIFICATION_VAGUE
                 )
                 clarification = interrupt({"question": question})
                 state.query += f"\n补充信息：{clarification}"
@@ -226,7 +314,8 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 descs = "、".join(
                     [f"{t.description}（置信度{t.confidence:.2f}）" for t in low_conf_tasks]
                 )
-                question = f"以下任务置信度较低，请补充相关信息：{descs}"
+                fallback = f"以下任务置信度较低，请补充相关信息：{descs}"
+                question = _resolve_clarification_prompt(result, fallback)
                 clarification = interrupt({"question": question})
                 state.query += f"\n补充信息：{clarification}"
                 continue
@@ -242,10 +331,11 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                             for t in invalid_cap_tasks
                         ]
                     )
-                    question = (
+                    fallback = (
                         f"无法为以下任务匹配 Agent 能力：{descs}。"
                         "请补充更具体的业务意图，例如查询项目信息、统计分析或投资评估。"
                     )
+                    question = _resolve_clarification_prompt(result, fallback)
                     clarification = interrupt({"question": question})
                     state.query += f"\n补充信息：{clarification}"
                     capability_fix_attempts = 0
@@ -267,6 +357,28 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             break
 
         return state
+
+    async def direct_reply(state: MainState, config: RunnableConfig) -> MainState:
+        """非业务 query 直接由 LLM 回复，不调度业务 Agent。"""
+        summary_publisher = _get_summary_publisher(config)
+        messages = [
+            ("system", DIRECT_REPLY_SYSTEM_PROMPT),
+            ("human", state.query),
+        ]
+        summary_text = await _stream_llm_text(llm, messages, summary_publisher)
+        if not summary_text.strip():
+            summary_text = "您好，我是电网智能助手。您可以告诉我需要查询、统计、规划或投资分析哪方面的内容。"
+
+        state.summary = summary_text
+        state.final_artifacts = [{"type": "text", "text": summary_text}]
+        state.status = "completed"
+        return state
+
+    def route_after_recognize(state: MainState) -> str:
+        """意图识别后路由：非业务 query 直接回复，否则进入任务编排。"""
+        if state.intent_result and not state.intent_result.is_business_query:
+            return "direct_reply"
+        return "build_phases"
 
     def build_phases(state: MainState) -> MainState:
         """根据任务依赖关系拓扑排序并分层。"""
@@ -312,7 +424,102 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         state.status = "executing"
         return state
 
-    async def execute_current_phase(state: MainState) -> MainState:
+    async def _await_business_call(
+        tid: str,
+        subtask: SubTask,
+        agent_cards: List[Any],
+        session_id: str,
+        subtask_map: Dict[str, SubTask],
+        task_outputs: Dict[str, TaskOutput],
+        business_task_id: Optional[str] = None,
+        resume_text: Optional[str] = None,
+    ) -> tuple[str, Any]:
+        """调用业务 Agent，返回 (task_id, result_or_exception)。"""
+        try:
+            result = await call_business_agent(
+                subtask,
+                agent_cards,
+                session_id,
+                task_outputs=task_outputs,
+                subtask_map=subtask_map,
+                business_task_id=business_task_id,
+                resume_text=resume_text,
+            )
+            return tid, result
+        except Exception as exc:
+            return tid, exc
+
+    async def _resume_business_until_done(
+        tid: str,
+        subtask: SubTask,
+        agent_cards: List[Any],
+        session_id: str,
+        subtask_map: Dict[str, SubTask],
+        task_outputs: Dict[str, TaskOutput],
+        state: MainState,
+        config: RunnableConfig,
+        initial_result: Dict[str, Any],
+    ) -> Any:
+        """处理业务 Agent input_required，在图节点内 interrupt 并 resume。"""
+        result = initial_result
+        business_task_id = result.get("business_task_id")
+        while result.get("status") == "input_required":
+            trace_info = result.get("trace", {})
+            agent_name = trace_info.get("agent_name", subtask.required_capability)
+            await _record_trace(
+                state,
+                InvocationTraceEntry(
+                    step=0,
+                    agent_type="business",
+                    agent_name=agent_name,
+                    capability=subtask.required_capability,
+                    phase=state.current_phase_idx,
+                    task_id=tid,
+                    input={
+                        "endpoint": trace_info.get("endpoint", ""),
+                        "subtask": trace_info.get("subtask", subtask.model_dump()),
+                        "message_parts": trace_info.get("message_parts", []),
+                    },
+                    output={
+                        "question": result.get("question", ""),
+                        "parts": result.get("parts", []),
+                    },
+                    status="input_required",
+                ),
+                config,
+            )
+            question = result.get("question", "请补充信息")
+            prefix = f"【{agent_name} · 待确认】\n"
+            if not question.startswith("【"):
+                question = f"{prefix}{question}"
+            user_reply = interrupt(
+                {
+                    "type": "business_confirm",
+                    "question": question,
+                    "parts": result.get("parts", []),
+                    "subtask_id": tid,
+                    "business_task_id": business_task_id,
+                    "capability": subtask.required_capability,
+                    "agent_name": agent_name,
+                }
+            )
+            _, result = await _await_business_call(
+                tid,
+                subtask,
+                agent_cards,
+                session_id,
+                subtask_map,
+                task_outputs,
+                business_task_id=business_task_id,
+                resume_text=str(user_reply),
+            )
+            if isinstance(result, Exception):
+                return result
+        return result
+
+    async def execute_current_phase(
+        state: MainState, config: RunnableConfig
+    ) -> MainState:
         """并行执行当前 Phase 的所有任务。"""
         if state.current_phase_idx >= len(state.phases):
             return state
@@ -324,59 +531,138 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         }
 
         session_id = state.session_id or "default"
-        coros = []
-        for tid in phase_task_ids:
-            subtask = subtask_map.get(tid)
-            if not subtask:
-                state.failed_task_id = tid
-                state.error_message = f"任务 {tid} 未找到对应的 SubTask"
-                state.status = "failed"
-                return state
-            coros.append(
-                call_business_agent(
+        phase_results: Dict[str, Any] = {}
+        pending_tids = list(phase_task_ids)
+
+        while pending_tids:
+            pending_tasks: Dict[asyncio.Task[tuple[str, Any]], str] = {}
+            for tid in pending_tids:
+                subtask = subtask_map.get(tid)
+                if not subtask:
+                    state.failed_task_id = tid
+                    state.error_message = f"任务 {tid} 未找到对应的 SubTask"
+                    state.status = "failed"
+                    return state
+                pending_tasks[
+                    asyncio.create_task(
+                        _await_business_call(
+                            tid,
+                            subtask,
+                            agent_cards,
+                            session_id,
+                            subtask_map,
+                            state.task_outputs,
+                        )
+                    )
+                ] = tid
+
+            pending = set(pending_tasks.keys())
+            input_required_tid: Optional[str] = None
+            input_required_result: Optional[Dict[str, Any]] = None
+            completed_tids: List[str] = []
+
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    tid, result = await task
+                    if isinstance(result, Exception):
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        subtask = subtask_map[tid]
+                        await _record_trace(
+                            state,
+                            InvocationTraceEntry(
+                                step=0,
+                                agent_type="business",
+                                agent_name=subtask.required_capability,
+                                capability=subtask.required_capability,
+                                phase=state.current_phase_idx,
+                                task_id=tid,
+                                input={
+                                    "subtask": subtask.model_dump(),
+                                    "message_parts": build_task_parts(
+                                        subtask,
+                                        state.task_outputs,
+                                        subtask_map,
+                                    ),
+                                },
+                                output={"error": str(result)},
+                                status="failed",
+                            ),
+                            config,
+                        )
+                        state.failed_task_id = tid
+                        state.error_message = (
+                            f"任务 {tid}（{subtask.required_capability}）"
+                            f"执行失败（已重试3次）：{str(result)}"
+                        )
+                        state.status = "failed"
+                        return state
+
+                    if result.get("status") == "input_required":
+                        input_required_tid = tid
+                        input_required_result = result
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        pending.clear()
+                        break
+
+                    phase_results[tid] = result
+                    completed_tids.append(tid)
+
+            for tid in completed_tids:
+                pending_tids.remove(tid)
+
+            if input_required_tid is not None and input_required_result is not None:
+                subtask = subtask_map[input_required_tid]
+                final_result = await _resume_business_until_done(
+                    input_required_tid,
                     subtask,
                     agent_cards,
                     session_id,
-                    task_outputs=state.task_outputs,
-                    subtask_map=subtask_map,
-                )
-            )
-
-        results = await asyncio.gather(*coros, return_exceptions=True)
-
-        for tid, result in zip(phase_task_ids, results):
-            subtask = subtask_map[tid]
-            if isinstance(result, Exception):
-                _append_trace(
+                    subtask_map,
+                    state.task_outputs,
                     state,
-                    InvocationTraceEntry(
-                        step=0,
-                        agent_type="business",
-                        agent_name=subtask.required_capability,
-                        capability=subtask.required_capability,
-                        phase=state.current_phase_idx,
-                        task_id=tid,
-                        input={
-                            "subtask": subtask.model_dump(),
-                            "message_parts": build_task_parts(
-                                subtask,
-                                state.task_outputs,
-                                subtask_map,
-                            ),
-                        },
-                        output={"error": str(result)},
-                        status="failed",
-                    ),
+                    config,
+                    input_required_result,
                 )
-                state.failed_task_id = tid
-                state.error_message = (
-                    f"任务 {tid}（{subtask.required_capability}）执行失败（已重试3次）：{str(result)}"
-                )
-                state.status = "failed"
-                return state
+                if isinstance(final_result, Exception):
+                    await _record_trace(
+                        state,
+                        InvocationTraceEntry(
+                            step=0,
+                            agent_type="business",
+                            agent_name=subtask.required_capability,
+                            capability=subtask.required_capability,
+                            phase=state.current_phase_idx,
+                            task_id=input_required_tid,
+                            input={"subtask": subtask.model_dump()},
+                            output={"error": str(final_result)},
+                            status="failed",
+                        ),
+                        config,
+                    )
+                    state.failed_task_id = input_required_tid
+                    state.error_message = (
+                        f"任务 {input_required_tid}（{subtask.required_capability}）"
+                        f"执行失败（已重试3次）：{str(final_result)}"
+                    )
+                    state.status = "failed"
+                    return state
 
+                phase_results[input_required_tid] = final_result
+                pending_tids.remove(input_required_tid)
+                continue
+
+            break
+
+        for tid in phase_task_ids:
+            result = phase_results[tid]
+            subtask = subtask_map[tid]
             trace_info = result.get("trace", {})
-            _append_trace(
+            await _record_trace(
                 state,
                 InvocationTraceEntry(
                     step=0,
@@ -394,8 +680,8 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                     output={"artifacts": result.get("artifacts", [])},
                     status="success",
                 ),
+                config,
             )
-
             state.task_outputs[tid] = TaskOutput(
                 task_id=tid,
                 required_capability=subtask.required_capability,
@@ -439,7 +725,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         state.final_artifacts = raw_artifacts
         return state
 
-    async def summarize(state: MainState) -> MainState:
+    async def summarize(state: MainState, config: RunnableConfig) -> MainState:
         """调用 LLM 生成自然语言总结。"""
         if state.status == "failed":
             state.summary = state.error_message
@@ -451,47 +737,45 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
 
         user_message = _build_summarize_user_message(state)
         file_links = _extract_file_links(state)
-
-        messages = [
-            ("system", SUMMARIZE_SYSTEM_PROMPT),
-            ("human", user_message),
-        ]
-
-        try:
-            response = await llm.ainvoke(messages)
-            summary_text = str(response.content)
-        except Exception as e:
-            # 总结失败不影响主流程，降级为简单拼接
+        summary_publisher = _get_summary_publisher(config)
+        summary_text = await _stream_llm_text(
+            llm,
+            [
+                ("system", SUMMARIZE_SYSTEM_PROMPT),
+                ("human", user_message),
+            ],
+            summary_publisher,
+        )
+        if not summary_text.strip():
             summary_text = "任务执行完成。以下是各业务 Agent 的原始结果："
 
         # 确保总结包含业务 Agent 返回的具体数据
         raw_texts = _collect_task_output_texts(state)
         missing_texts = [text for text in raw_texts if text and text not in summary_text]
         if missing_texts:
-            summary_text += "\n\n" + "\n\n".join(missing_texts)
+            appendix = "\n\n" + "\n\n".join(missing_texts)
+            summary_text += appendix
+            if summary_publisher is not None:
+                await summary_publisher(appendix)
 
         # 附加文件链接引用
         if file_links:
-            summary_text += "\n\n相关文件："
+            link_lines = "\n\n相关文件："
             for link in file_links:
-                summary_text += (
+                link_lines += (
                     f"\n- {link['required_capability']}（{link['description']}）：{link['url']}"
                 )
+            summary_text += link_lines
+            if summary_publisher is not None:
+                await summary_publisher(link_lines)
 
         state.summary = summary_text
 
-        # 将总结作为第一个 artifact
+        # 成功路径不再附加 invocation_trace artifact，轨迹已在 WORKING 阶段流式推送
         final_artifacts = [
             {"type": "text", "text": summary_text}
         ]
         final_artifacts.extend(state.final_artifacts)
-        if state.invocation_traces:
-            final_artifacts.append(
-                {
-                    "type": "invocation_trace",
-                    "traces": list(state.invocation_traces),
-                }
-            )
         state.final_artifacts = final_artifacts
 
         state.status = "completed"
@@ -509,13 +793,22 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
     workflow = StateGraph(MainState)
 
     workflow.add_node("recognize_and_check", recognize_and_check)
+    workflow.add_node("direct_reply", direct_reply)
     workflow.add_node("build_phases", build_phases)
     workflow.add_node("execute_current_phase", execute_current_phase)
     workflow.add_node("finalize", finalize)
     workflow.add_node("summarize", summarize)
 
     workflow.set_entry_point("recognize_and_check")
-    workflow.add_edge("recognize_and_check", "build_phases")
+    workflow.add_conditional_edges(
+        "recognize_and_check",
+        route_after_recognize,
+        {
+            "direct_reply": "direct_reply",
+            "build_phases": "build_phases",
+        },
+    )
+    workflow.add_edge("direct_reply", END)
     workflow.add_edge("build_phases", "execute_current_phase")
     workflow.add_conditional_edges(
         "execute_current_phase",

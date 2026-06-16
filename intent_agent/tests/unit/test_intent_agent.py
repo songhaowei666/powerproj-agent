@@ -29,6 +29,7 @@ class TestModels:
 
     def test_intent_result_serialization(self):
         result = IntentResult(
+            is_business_query=True,
             task_goal="查询项目信息并下载文件",
             subtasks=[
                 SubTask(
@@ -49,6 +50,20 @@ class TestModels:
         assert len(data["subtasks"]) == 1
         assert data["execution_order"] == ["task_1"]
         assert data["reasoning"] == "用户要求查询项目信息"
+        assert data["is_business_query"] is True
+        assert data["clarification_prompt"] is None
+
+    def test_intent_result_non_business(self):
+        result = IntentResult(
+            is_business_query=False,
+            task_goal="用户问候",
+            subtasks=[],
+            execution_order=[],
+            reasoning="问候语",
+        )
+        data = result.model_dump()
+        assert data["is_business_query"] is False
+        assert data["subtasks"] == []
 
     def test_intent_result_from_json(self):
         raw = {
@@ -103,6 +118,8 @@ class TestPrompts:
         agent_cards = [self._build_mock_agent_card("test-skill")]
         prompt = build_system_prompt([], agent_cards)
         assert "多意图识别与任务规划专家" in prompt
+        assert "is_business_query" in prompt
+        assert "clarification_prompt" in prompt
         assert "test-skill" in prompt
         assert "测试能力" in prompt
         assert "project-query" not in prompt

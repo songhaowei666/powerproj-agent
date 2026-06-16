@@ -4,11 +4,12 @@
 
 ## 系统架构
 
-用户请求统一进入 **主控 Agent (Main Agent)**，由它调用意图识别模块解析任务，再按依赖关系分阶段调度下游业务 Agent，最后汇总各任务结果返回。
+用户请求统一进入 **主控 Agent (Main Agent)**，由它调用意图识别模块解析任务，再按依赖关系分阶段调度下游业务 Agent，最后汇总各任务结果返回。除 curl / A2A Client 外，也可通过 **Web 聊天页**（`:8501`）交互。
 
 ```mermaid
 flowchart TB
-    User["用户 / A2A Client"]
+    User["用户 / A2A Client / Web 聊天页"]
+    Web["Web 聊天页 :8501"]
     Main["Main Agent :8000"]
     Intent["Intent Agent（内嵌）"]
     Stats["Statistics Agent :8003"]
@@ -16,6 +17,7 @@ flowchart TB
     Invest["Investment Agent :8002"]
 
     User -->|tasks/send| Main
+    Web -->|tasks/send| Main
     Main --> Intent
     Main -->|Phase 并行调度| Stats
     Main -->|Phase 并行调度| Plan
@@ -24,13 +26,14 @@ flowchart TB
     Plan --> Main
     Invest --> Main
     Main -->|completed / input-required / failed| User
+    Main -->|completed / input-required / failed| Web
 ```
 
 ### 核心流程
 
-1. **Agent 网络发现**：主控 Agent 启动时拉取下游 Agent Card，构建可用能力列表
-2. **意图识别**：将自然语言 query 解析为带依赖关系的任务列表（统计 / 规划 / 投资）
-3. **置信度补全**：任务为空或任意任务置信度 < 0.8 时，通过 `interrupt` 暂停并返回 `input-required`，等待用户补充后重新识别
+1. **Agent 网络发现**：主控 Agent 启动时拉取下游 Agent Card，构建可用 Skill 能力列表
+2. **意图识别**：将自然语言 query 解析为带依赖关系与 `required_capability` 的子任务规划
+3. **置信度与能力补全**：任务为空、任意任务置信度 < 0.8、或 `required_capability` 为空/未注册时，通过 `interrupt` 暂停并返回 `input-required`，等待用户补充后重新识别
 4. **分阶段并行**：按 DAG 拓扑分层，同层任务 `asyncio.gather` 并行，层间串行
 5. **失败熔断**：单任务最多重试 3 次，任一任务最终失败则终止后续 Phase
 6. **结果汇总**：LLM 生成自然语言总结，并保留各业务 Agent 原始 artifacts
@@ -44,15 +47,21 @@ flowchart TB
 | 投资 Agent | `investment_agent/` | 8002 | 电力项目投资测算与造价分析 |
 | 统计 Agent | `statistics_agent/` | 8003 | 电力项目规模统计与指标对比 |
 | 意图识别 | `intent_agent/` | — | 内嵌于主控 Agent，非独立服务 |
+| Web 聊天页 | `web/` | 8501 | Streamlit 界面，通过主控 Agent 调度业务能力 |
 | A2A 验证器 | `a2a_validator/` | — | Streamlit 诊断工具，验证任意 A2A 端点 |
 
-业务类型与 endpoint 映射见 `main_agent/registry.py`：
+### 能力路由
 
-| 业务类型 | Endpoint |
-|----------|----------|
-| 统计业务 | `http://localhost:8003` |
-| 规划业务 | `http://localhost:8001` |
-| 投资业务 | `http://localhost:8002` |
+任务调度采用 **能力驱动** 模式：意图识别为每个子任务指定 `required_capability`（对应 AgentCard 中某个 Skill 的 `id`），主控 Agent 在已发现的 AgentCard 中查找匹配 Skill 并路由到对应 endpoint。
+
+- **Endpoint 注册**：`main_agent/registry.py` 中的 `DEFAULT_AGENT_URLS` 定义下游 Agent 地址
+- **能力匹配与调用**：`main_agent/executor.py` 根据 `required_capability` 查找 Skill 并发起 A2A 请求
+
+| Agent | Endpoint | Skill id |
+|-------|----------|----------|
+| planning-agent | `http://localhost:8001` | `project-query`, `file-management` |
+| investment-agent | `http://localhost:8002` | `project-investment-analysis`, `project-cost-estimation` |
+| statistics-agent | `http://localhost:8003` | `project-statistics`, `project-scale-comparison` |
 
 ## 技术栈
 
@@ -64,27 +73,29 @@ flowchart TB
 | 配置管理 | `pydantic-settings` + `.env` |
 | 数据库 | SQLite（Planning Agent） |
 | HTTP 客户端 | `httpx` |
-| 验证工具 UI | `streamlit` |
+| 验证工具 / 聊天 UI | `streamlit` |
 | 测试 | `pytest`, `pytest-asyncio` |
 
 ## 目录结构
 
 ```
 powerproj-agent/
-├── a2a_base.py           # A2A Server 快捷入口（get_a2a_app / create_server）
-├── a2a_validator/        # A2A 协议验证工具（Streamlit）
-├── config/               # 全局配置（pydantic-settings）
-├── intent_agent/         # 意图识别 Agent（LangGraph）
-├── main_agent/           # 主控 Agent（编排调度）
-├── planning_agent/       # 规划 Agent（SQLite + 文件管理）
-├── investment_agent/     # 投资 Agent
-├── statistics_agent/     # 统计 Agent
-├── providers/            # LLM 统一实例化
-├── rag/                  # RAG 基础设施（预留）
-├── examples/             # A2A 调用示例与演示脚本
-├── spec/                 # 各 Agent 技术规格文档
-├── AGENTS.md             # Agent 开发约束与编码规范
-└── requirements.txt      # 项目依赖
+├── a2a_base.py              # A2A Server 快捷入口（get_a2a_app / create_server）
+├── a2a_message_parser/      # A2A message.parts 解析，主控调用下游时传递上游上下文
+├── a2a_validator/           # A2A 协议验证工具（Streamlit）
+├── config/                  # 全局配置（pydantic-settings）
+├── intent_agent/            # 意图识别 Agent（LangGraph，内嵌于主控）
+├── main_agent/              # 主控 Agent（编排调度）
+├── planning_agent/          # 规划 Agent（SQLite + 文件管理）
+├── investment_agent/        # 投资 Agent
+├── statistics_agent/        # 统计 Agent
+├── providers/               # LLM 统一实例化
+├── web/                     # Web 聊天页（Streamlit）
+├── scripts/                 # 一键启动 / 停止脚本
+├── examples/                # A2A 调用示例与演示脚本
+├── spec/                    # 各 Agent 技术规格文档
+├── AGENTS.md                # Agent 开发约束与编码规范
+└── requirements.txt         # 项目依赖
 ```
 
 ## 快速开始
@@ -128,7 +139,29 @@ MINERU_API_KEY=your-mineru-key
 
 ### 3. 启动服务
 
-各 Agent 需分别启动。**必须先启动业务 Agent，再启动主控 Agent**：主控 Agent 在生命周期内会调用 `agent_network.discover()` 拉取下游 Agent Card，若业务 Agent 未就绪会导致发现失败。
+**必须先启动业务 Agent，再启动主控 Agent**：主控 Agent 在生命周期内会调用 `agent_network.discover()` 拉取下游 Agent Card，若业务 Agent 未就绪会导致发现失败。
+
+#### 方式一：一键启动（推荐）
+
+```bash
+bash scripts/start_all.sh
+```
+
+脚本会依次启动三个业务 Agent、主控 Agent 和 Web 聊天页，日志写入 `logs/` 目录。停止所有服务：
+
+```bash
+bash scripts/stop_all.sh
+```
+
+| 服务 | 地址 |
+|------|------|
+| 规划 Agent | http://localhost:8001 |
+| 投资 Agent | http://localhost:8002 |
+| 统计 Agent | http://localhost:8003 |
+| 主控 Agent | http://localhost:8000 |
+| Web 聊天页 | http://localhost:8501 |
+
+#### 方式二：分别启动
 
 ```bash
 # 终端 1 - 规划 Agent
@@ -142,18 +175,27 @@ python statistics_agent/main.py
 
 # 终端 4 - 主控 Agent（用户入口）
 python main_agent/server.py
+
+# 终端 5 - Web 聊天页（可选）
+streamlit run web/app.py
 ```
 
-启动后可访问各 Agent 的 Agent Card：
+启动后可访问各 Agent 的 Agent Card（a2a-sdk 默认路径）：
 
 ```bash
-curl http://localhost:8000/.well-known/agent.json   # 主控
-curl http://localhost:8001/.well-known/agent.json   # 规划
-curl http://localhost:8002/.well-known/agent.json   # 投资
-curl http://localhost:8003/.well-known/agent.json   # 统计
+curl http://localhost:8000/.well-known/agent-card.json   # 主控
+curl http://localhost:8001/.well-known/agent-card.json   # 规划
+curl http://localhost:8002/.well-known/agent-card.json   # 投资
+curl http://localhost:8003/.well-known/agent-card.json   # 统计
 ```
 
 ### 4. 发送请求
+
+#### Web 聊天页
+
+浏览器打开 http://localhost:8501 ，在界面中直接输入自然语言即可。页面会自动处理 `input-required` 多轮补全。
+
+#### curl / A2A Client
 
 通过 A2A JSON-RPC `tasks/send` 向主控 Agent 发送请求：
 
@@ -218,7 +260,7 @@ streamlit run a2a_validator/app.py
 | 验证项 | 说明 |
 |--------|------|
 | 连通性探测 | 检查 `GET {base_url}` 是否可达 |
-| Agent Card | 检查 `/.well-known/agent.json` 是否可解析 |
+| Agent Card | 检查 `/.well-known/agent-card.json` 是否可解析 |
 | 单消息测试 | 使用 `tasks/send` 发送测试消息 |
 | 流式测试 | 根据 Agent Card 的 `streaming` 能力决定是否测试 SSE 流式响应 |
 
@@ -252,17 +294,18 @@ streamlit run a2a_validator/app.py
 测试按 `unit/` 与 `functional/` 组织：
 
 ```bash
-# 运行 Planning Agent 单元测试
+# 单元测试
 pytest planning_agent/tests/unit -v
-
-# 运行 Main Agent 单元测试
 pytest main_agent/tests/unit -v
-
-# 运行 A2A 验证器测试
+pytest intent_agent/tests/unit -v
+pytest a2a_message_parser/tests -v
 pytest a2a_validator/tests -v
 
-# 运行功能测试（默认跳过，需显式开启）
+# 功能测试（Planning Agent 默认跳过，需显式开启）
 RUN_FUNCTIONAL_TESTS=1 pytest planning_agent/tests/functional -v
+
+# 意图识别功能测试（需配置 LLM 环境变量，未配置时自动跳过）
+pytest intent_agent/tests/functional -v
 ```
 
 功能测试直接访问真实目录和服务，不模拟数据。更多测试规范见 [`AGENTS.md`](AGENTS.md)。
@@ -283,6 +326,7 @@ RUN_FUNCTIONAL_TESTS=1 pytest planning_agent/tests/functional -v
 ## 设计原则
 
 - **LangGraph 节点极简**：每个节点只做一件事，状态通过 `state` 对象传递
+- **能力驱动路由**：子任务通过 `required_capability` 匹配 AgentCard Skill，而非硬编码业务类型
 - **中断恢复**：使用 `interrupt` + `Command(resume=...)` 实现多轮交互，不引入外部消息队列
 - **Phase 分层并行**：DAG 拓扑分层，同层并行、层间串行
 - **任务级熔断**：单任务重试 3 次仍失败，立即停止后续 Phase
@@ -293,4 +337,4 @@ RUN_FUNCTIONAL_TESTS=1 pytest planning_agent/tests/functional -v
 
 - `.env` 含敏感信息，已加入 `.gitignore`，请勿提交到版本库
 - 统计 Agent 与投资 Agent 当前返回固定测试数据，用于验证编排链路
-- 意图识别 Agent 的 RAG 少样本检索（`intent_agent/rag_stub.py`）当前返回空列表，后续可接入 `rag/` 模块
+- 意图识别 Agent 的 RAG 少样本检索（`intent_agent/rag_stub.py`）当前返回空列表，后续可接入 RAG 模块

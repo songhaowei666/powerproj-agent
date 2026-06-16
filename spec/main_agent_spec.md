@@ -105,9 +105,44 @@
 
 > 客户端收到 `input-required` 后，应再次调用 `tasks/send`（相同 `id`），在 `message.parts` 中携带用户的补充信息。
 
-### 3.5 A2A 输出 (调用轨迹 artifact)
+业务 Agent 返回项目/删除等确认时，主控 Agent 透传 `input-required`，并在 `status.message.parts` 中附带结构化 confirmation data（见 `a2a_message_parser/confirmation.py`）：
 
-主控 Agent 在 `artifacts` 末尾附加 `invocation_trace` 类型 artifact，记录意图识别 Agent 与各业务 Agent 的调用参数与返回结果。Web 聊天页通过解析 `__INVOCATION_TRACE__` 标记的 artifact part 展示调用轨迹。
+```json
+{
+  "parts": [
+    {"text": "找到最匹配的项目：\n名称：...\n\n请问是这个项目吗？"},
+    {
+      "mediaType": "application/vnd.powerproj.confirmation+json",
+      "data": {
+        "type": "confirmation",
+        "action": "project_confirm",
+        "title": "请确认项目",
+        "options": [
+          {"id": "yes", "label": "是", "replyText": "是"},
+          {"id": "no", "label": "否", "replyText": "否"}
+        ]
+      }
+    }
+  ]
+}
+```
+
+Web 客户端解析 `data` 渲染「是/否」按钮；用户点击后仍以 text part（`replyText`）回复，主控 Agent 代传至业务 Agent 的 `task_id` 恢复执行。
+
+### 3.5 A2A 流式输出 (调用轨迹与总结)
+
+主控 Agent 声明 `streaming=True`。执行过程中通过 `TASK_STATE_WORKING` 状态的 `status.message` 逐条推送：
+
+| 前缀 | 含义 |
+|------|------|
+| `__INVOCATION_TRACE_STEP__\n` + JSON | 单条调用轨迹（意图识别 / 业务 Agent） |
+| `__SUMMARY_CHUNK__\n` + 文本 | LLM 总结分块 |
+
+Web 聊天页在流式接收过程中实时解析上述前缀并渲染调用轨迹与总结。
+
+成功完成时，`artifacts` **不再**附加完整 `invocation_trace`（轨迹已在 WORKING 阶段推送完毕）。
+
+失败时，`artifacts` 仍附加完整 `invocation_trace` 作为兜底，供客户端离线解析。
 
 ### 3.6 A2A 输出 (执行失败)
 
@@ -361,16 +396,18 @@ async def recognize_and_check(state: MainState) -> MainState:
         result = await intent_agent.recognize(state.query, agent_cards)
         state.intent_result = result
 
+        if not result.is_business_query:
+            return state  # 路由至 direct_reply
+
         if not result.subtasks:
-            question = "您的请求不够明确，请补充更多细节，例如您想查询、统计、规划还是投资？"
+            question = result.clarification_prompt or "默认澄清模板"
             clarification = interrupt({"question": question})
             state.query += f"\n补充信息：{clarification}"
             continue
 
         low_conf_tasks = [t for t in result.subtasks if t.confidence < 0.8]
         if low_conf_tasks:
-            descs = "、".join([f"{t.description}（置信度{t.confidence:.2f}）" for t in low_conf_tasks])
-            question = f"以下任务置信度较低，请补充相关信息：{descs}"
+            question = result.clarification_prompt or "低置信度默认模板"
             clarification = interrupt({"question": question})
             state.query += f"\n补充信息：{clarification}"
             continue
@@ -385,9 +422,11 @@ async def recognize_and_check(state: MainState) -> MainState:
     return state
 ```
 
-> **关键机制**：`interrupt` 暂停图执行后，外部收到 `input-required`；用户再次发送补充信息，外部使用 `Command(resume=...)` 恢复；节点会**重新完整执行**，此时 `state.query` 已追加补充信息，`intent_agent.recognize()` 会重新识别，形成循环。
->
-> **AgentCard 来源**：每次进入该节点时从 `AgentNetwork` 获取最新 AgentCard，确保能感知 Agent 能力变化。
+#### direct_reply
+
+非业务 query（`is_business_query=false`）时，主控 LLM 直接生成友好回复，不调度业务 Agent，流式推送总结文本后 `completed`。
+
+> **澄清问句**：优先使用 `IntentResult.clarification_prompt`（由意图识别 LLM 生成），为空时回退到内置默认模板。
 
 #### build_phases
 

@@ -1,6 +1,6 @@
 """Pydantic 模型定义。"""
 
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -44,9 +44,17 @@ class TaskPlan(BaseModel):
 class IntentResult(BaseModel):
     """意图识别结果。"""
 
+    is_business_query: bool = Field(
+        default=True,
+        description="是否为电网业务相关查询；问候、闲聊、与业务无关的内容为 false",
+    )
     task_goal: str = Field(..., description="原始任务目标概述")
     subtasks: List[SubTask] = Field(..., description="子任务列表")
     execution_order: List[str] = Field(
         ..., description="按执行顺序排列的子任务 ID"
     )
     reasoning: str = Field(..., description="推理过程说明")
+    clarification_prompt: Optional[str] = Field(
+        default=None,
+        description="需要用户补充信息时，面向用户的澄清问句；非业务或信息已充分时为 null",
+    )

@@ -17,6 +17,17 @@ _TASK_PLANNING_RULES = """\
 
 _OUTPUT_RULES = """\
 ## 输出要求
+- 首先判断用户 query 是否为电网业务相关查询，填写 is_business_query：
+  - true：涉及项目查询、统计分析、规划、投资评估等业务意图，或业务意图不明确但可能属于上述范畴
+  - false：问候、闲聊、感谢、与电网业务无关的内容
+- 当 is_business_query 为 false 时：
+  - subtasks 必须为 []，execution_order 必须为 []
+  - clarification_prompt 必须为 null
+- 当 is_business_query 为 true 但无法拆出具体子任务时：
+  - subtasks 为 []，execution_order 为 []
+  - clarification_prompt 必须填写：1~3 句面向用户的澄清问句，结合用户原话与可用能力举例，引导其说明具体需求
+- 当 is_business_query 为 true 且已拆出子任务，但存在置信度不足或能力匹配问题时：
+  - 仍输出 subtasks，并在 clarification_prompt 中给出针对性澄清问句（可为 null，若信息已充分）
 - 仔细分析用户 query，识别其中涉及的一个或多个业务意图
 - 将每个意图拆分为可由单个 Agent 能力完成的子任务
 - 每个子任务必须包含：id, name, description, dependencies, expected_output, required_capability
@@ -27,6 +38,7 @@ _OUTPUT_RULES = """\
 - description 用一句话概括该子任务的具体内容
 - expected_output 说明该子任务完成后应产生的具体结果
 - 对每个子任务给出 confidence（0.0 ~ 1.0），表示对该子任务识别的置信度
+- clarification_prompt 必须是直接对用户说的话，不要使用「系统」「模型」等内部用语
 
 ## 输出格式
 

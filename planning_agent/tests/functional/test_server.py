@@ -7,6 +7,7 @@
 """
 
 import base64
+import json
 import os
 import uuid
 
@@ -90,13 +91,22 @@ class TestAggregateQuery:
                 }
             },
         )
+        print("\n[test_aggregate_query] 输入:")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+
         resp = test_client.post("/", json=payload, headers=A2A_HEADERS)
         assert resp.status_code == 200
-        task = _get_task_from_result(resp.json())
+
+        resp_json = resp.json()
+        print("\n[test_aggregate_query] 输出:")
+        print(json.dumps(resp_json, ensure_ascii=False, indent=2))
+
+        task = _get_task_from_result(resp_json)
         assert task["status"]["state"] == "TASK_STATE_COMPLETED"
         artifacts = task.get("artifacts", [])
         assert len(artifacts) > 0
         text = artifacts[0]["parts"][0].get("text", "")
+        print(f"\n[test_aggregate_query] 结果文本: {text}")
         # 真实 LLM 可能返回中文数字或描述，只要包含结果即可
         assert "变电" in text or "容量" in text or "总和" in text
 
