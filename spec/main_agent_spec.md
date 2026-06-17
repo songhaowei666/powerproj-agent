@@ -6,7 +6,7 @@
 
 1. **Agent 网络管理**：通过 `AgentNetwork` 发现和维护下游业务 Agent，统一拉取各 Agent 的 AgentCard
 2. **意图识别**：调度意图识别 Agent，基于当前 Agent 网络中的全部 AgentCard 对 user query 进行意图解析与任务规划
-3. **置信度检查与补全循环**：当任务为空、任意子任务置信度 < 0.8、或 `required_capability` 为空/未注册时，向用户发起澄清提问或自动重试识别，直到满足条件
+3. **置信度检查与补全循环**：当任务为空、任意子任务置信度 < 0.8、或 `required_agent` 为空/未注册时，向用户发起澄清提问或自动重试识别，直到满足条件
 4. **分阶段并行调度**：根据子任务依赖关系构建 DAG，按拓扑分层，同层任务并行执行，层间串行
 5. **失败重试与熔断**：每个任务最多重试 3 次，任一任务最终失败即终止整个流程并返回错误
 6. 透传业务 Agent 返回的文本与文件下载链接
@@ -20,7 +20,7 @@
 | 业务 Agent | 下游具体执行业务的 Agent：statistics-agent、planning-agent、investment-agent |
 | AgentNetwork | 主控 Agent 维护的 Agent 注册表与发现组件，负责拉取并缓存 AgentCard |
 | Skill | AgentCard 中定义的单个能力，含 `id/name/description/tags/examples` |
-| SubTask | 意图识别输出的子任务，包含 `id/name/description/dependencies/expected_output/required_capability` |
+| SubTask | 意图识别输出的子任务，包含 `id/name/description/dependencies/expected_output/required_agent` |
 | Phase | 执行阶段。按依赖拓扑分层后，同一层无依赖关系的任务构成一个 Phase |
 | 置信度补全循环 | 当识别结果不满足置信度阈值时，通过 `interrupt` 暂停图执行，等待用户补充信息后恢复并重新识别 |
 | 任务熔断 | 某个任务重试 3 次仍失败后，立即停止后续所有 Phase 的执行 |
@@ -66,7 +66,7 @@
     {
       "type": "task_result",
       "task_id": "task_1",
-      "required_capability": "project-query",
+      "required_agent": "planning-agent",
       "artifacts": [
         {"type": "text", "text": "项目信息原文..."}
       ]
@@ -74,7 +74,7 @@
     {
       "type": "task_result",
       "task_id": "task_2",
-      "required_capability": "file-management",
+      "required_agent": "planning-agent",
       "artifacts": [
         {"type": "file", "url": "http://xxx/design.pdf", "name": "可研设计.pdf"}
       ]
@@ -191,7 +191,7 @@ class TaskOutput(BaseModel):
     """单个子任务的执行结果。"""
 
     task_id: str
-    required_capability: str
+    required_agent: str
     status: str           # "success" | "failed"
     artifacts: List[Dict[str, Any]] = []
     error: Optional[str] = None
@@ -284,15 +284,15 @@ async def call_business_agent(
     调用下游业务 Agent 的 A2A JSON-RPC 接口。
 
     内部行为：
-    - 根据 subtask.required_capability 在 agent_cards 中查找匹配的 Skill
-    - 通过 Skill 所属 AgentCard 的 supported_interfaces 获取 endpoint URL
+    - 根据 subtask.required_agent 在 agent_cards 中查找匹配的 AgentCard
+    - 通过 AgentCard 的 supported_interfaces 获取 endpoint URL
     - 使用 build_task_parts 构造 message.parts（含前置依赖任务结果）
     - 构造 SendMessage JSON-RPC 请求
     - 最多重试 3 次（含指数退避）
     - 返回 {"status": "success", "artifacts": [...]}
 
     异常：
-    - 找不到匹配的 Skill 或 endpoint 时抛出 ValueError
+    - 找不到匹配的 Agent 或 endpoint 时抛出 ValueError
     - 超过 3 次仍失败时抛出 Exception，由 graph 节点捕获并触发熔断
     """
 ```
@@ -412,7 +412,7 @@ async def recognize_and_check(state: MainState) -> MainState:
             state.query += f"\n补充信息：{clarification}"
             continue
 
-        invalid_cap_tasks = _find_invalid_capability_subtasks(result.subtasks, registered_skills)
+        invalid_agent_tasks = _find_invalid_agent_subtasks(result.subtasks, registered_agents)
         if invalid_cap_tasks:
             # 先自动追加系统提示重试识别；超过阈值后 interrupt 让用户补充
             ...
@@ -472,7 +472,7 @@ async def recognize_and_check(state: MainState) -> MainState:
 #### summarize
 
 - 调用 LLM 对所有成功的 `task_outputs` 生成一段自然语言总结
-- 输入：各子任务的 `required_capability`、`description`、以及 `artifacts` 中的 `text` 内容
+- 输入：各子任务的 `required_agent`、`description`、以及 `artifacts` 中的 `text` 内容
 - 输出：`state.summary`（字符串）
 - 文件链接单独提取，以引用列表形式附在总结末尾，不交给 LLM 处理内容
 - `final_artifacts` 第一个元素为总结文本，后续为原始 `task_result` 结构
@@ -532,7 +532,7 @@ graph = build_main_graph(llm, network)
 - 启动时 `discover()` 一次
 - 提供 `refresh()` 接口供外部触发刷新
 - 每次请求使用 `get_cards()` 读取缓存
-- 执行阶段若找不到对应 Skill，再尝试 `discover()` 刷新
+- 执行阶段若找不到对应 Agent，再尝试 `discover()` 刷新
 
 ## 8. 重试与容错
 
@@ -595,7 +595,7 @@ main_agent/
 
 ## 11. 关键设计决策
 
-1. **AgentNetwork 集中管理 AgentCard**：主控 Agent 统一发现下游 Agent 能力，避免意图识别 Agent 硬编码业务类型与 URL，实现能力驱动的任务规划。
+1. **AgentNetwork 集中管理 AgentCard**：主控 Agent 统一发现下游 Agent，避免意图识别 Agent 硬编码业务类型与 URL，实现 Agent 驱动的任务规划。
 2. **LangGraph `interrupt` 实现同步阻塞式交互**：利用 LangGraph 内置的 `interrupt` / `Command(resume=...)` 机制，在 `recognize_and_check` 节点中暂停图执行，无需外部消息队列或 WebSocket。
 3. **单节点内循环完成意图重识别**：`recognize_and_check` 使用 `while True` 封装"识别 → 检查 → 中断 → 恢复 → 重新识别"的完整循环，避免在图中增加多余的回环边。
 4. **Phase 分层执行实现依赖调度**：不引入复杂的工作流引擎，仅用 Kahn 算法对 DAG 分层，`asyncio.gather` 实现层内并行，条件边实现层间串行。

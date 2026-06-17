@@ -21,68 +21,63 @@ A2A_HEADERS = {
 }
 
 
-def _find_agent_url(agent_cards: List[Any], capability: str) -> str:
-    """根据 required_capability 查找对应 Agent 的 JSON-RPC endpoint。
+def _get_card_name(card: Any) -> str:
+    """从 AgentCard 对象或 dict 中读取 name。"""
+    if isinstance(card, dict):
+        return str(card.get("name", "")).strip()
+    return str(getattr(card, "name", "")).strip()
+
+
+def _find_agent_url(agent_cards: List[Any], agent_name: str) -> str:
+    """根据 required_agent 查找对应 Agent 的 JSON-RPC endpoint。
 
     Args:
         agent_cards: 可用 AgentCard 列表
-        capability: 子任务所需的 skill id
+        agent_name: 子任务目标 Agent 名称（AgentCard.name）
 
     Returns:
         A2A endpoint URL
 
     Raises:
-        ValueError: 找不到匹配 capability 或 endpoint 时
+        ValueError: 找不到匹配 Agent 或 endpoint 时
     """
+    normalized = agent_name.strip()
     for card in agent_cards:
-        skills = getattr(card, "skills", [])
-        for skill in skills:
-            skill_id = getattr(skill, "id", "")
-            if skill_id == capability:
-                interfaces = getattr(card, "supported_interfaces", [])
-                for iface in interfaces:
-                    binding = getattr(iface, "protocol_binding", "")
-                    if binding.upper() == "JSONRPC":
-                        url = getattr(iface, "url", "")
-                        if url:
-                            return url.rstrip("/")
-                raise ValueError(
-                    f"Skill '{capability}' 所属 Agent 未配置 JSONRPC endpoint"
-                )
+        if _get_card_name(card) != normalized:
+            continue
+        interfaces = getattr(card, "supported_interfaces", [])
+        if isinstance(card, dict):
+            interfaces = card.get("supported_interfaces", interfaces)
+        for iface in interfaces:
+            binding = getattr(iface, "protocol_binding", "")
+            if isinstance(iface, dict):
+                binding = iface.get("protocol_binding", binding)
+            if binding.upper() == "JSONRPC":
+                url = getattr(iface, "url", "")
+                if isinstance(iface, dict):
+                    url = iface.get("url", url)
+                if url:
+                    return url.rstrip("/")
+        raise ValueError(
+            f"Agent '{normalized}' 未配置 JSONRPC endpoint"
+        )
 
+    registered = sorted({_get_card_name(card) for card in agent_cards if _get_card_name(card)})
     raise ValueError(
-        f"未找到支持能力 '{capability}' 的 Agent，"
-        f"已注册能力: {[getattr(s, 'id', '') for c in agent_cards for s in getattr(c, 'skills', [])]}"
+        f"未找到业务 Agent '{normalized}'，"
+        f"已注册 Agent: {registered}"
     )
 
 
-def _find_agent_info(agent_cards: List[Any], capability: str) -> tuple[str, str]:
-    """根据 required_capability 查找 Agent 名称与 endpoint。
+def _find_agent_info(agent_cards: List[Any], agent_name: str) -> tuple[str, str]:
+    """根据 required_agent 查找 Agent 名称与 endpoint。
 
     Returns:
         (agent_name, endpoint_url)
     """
-    for card in agent_cards:
-        skills = getattr(card, "skills", [])
-        for skill in skills:
-            skill_id = getattr(skill, "id", "")
-            if skill_id == capability:
-                agent_name = getattr(card, "name", capability)
-                interfaces = getattr(card, "supported_interfaces", [])
-                for iface in interfaces:
-                    binding = getattr(iface, "protocol_binding", "")
-                    if binding.upper() == "JSONRPC":
-                        url = getattr(iface, "url", "")
-                        if url:
-                            return agent_name, url.rstrip("/")
-                raise ValueError(
-                    f"Skill '{capability}' 所属 Agent 未配置 JSONRPC endpoint"
-                )
-
-    raise ValueError(
-        f"未找到支持能力 '{capability}' 的 Agent，"
-        f"已注册能力: {[getattr(s, 'id', '') for c in agent_cards for s in getattr(c, 'skills', [])]}"
-    )
+    normalized = agent_name.strip()
+    url = _find_agent_url(agent_cards, normalized)
+    return normalized, url
 
 
 def _artifact_to_message_parts(artifact: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -159,7 +154,7 @@ def build_task_parts(
         parts.append(
             {
                 "text": build_upstream_header(
-                    dep_id, output.required_capability, dep_name
+                    dep_id, output.required_agent, dep_name
                 )
             }
         )
@@ -285,8 +280,8 @@ async def call_business_agent(
         ValueError: 找不到匹配 Agent 或 endpoint 时
         Exception: 超过最大重试次数仍失败时抛出
     """
-    url = _find_agent_url(agent_cards, subtask.required_capability)
-    agent_name, _ = _find_agent_info(agent_cards, subtask.required_capability)
+    url = _find_agent_url(agent_cards, subtask.required_agent)
+    agent_name, _ = _find_agent_info(agent_cards, subtask.required_agent)
     if resume_text is not None:
         if not business_task_id:
             raise ValueError(
@@ -339,7 +334,8 @@ async def call_business_agent(
                         "trace": {
                             "agent_name": agent_name,
                             "endpoint": url,
-                            "capability": subtask.required_capability,
+                            "agent_name": agent_name,
+                            "required_agent": subtask.required_agent,
                             "subtask": subtask.model_dump(),
                             "message_parts": message_parts,
                             "request": payload,
@@ -354,7 +350,7 @@ async def call_business_agent(
                     "trace": {
                         "agent_name": agent_name,
                         "endpoint": url,
-                        "capability": subtask.required_capability,
+                        "required_agent": subtask.required_agent,
                         "subtask": subtask.model_dump(),
                         "message_parts": message_parts,
                         "request": payload,

@@ -102,10 +102,10 @@ async def test_recognize_planning_query():
     assert result.execution_order
     assert result.reasoning
 
-    # 所有子任务的能力必须在可用 skills 中
-    available_skills = {s.id for card in agent_cards for s in card.skills}
+    # 所有子任务的目标 Agent 必须在可用列表中
+    available_agents = {card.name for card in agent_cards}
     for subtask in result.subtasks:
-        assert subtask.required_capability in available_skills
+        assert subtask.required_agent in available_agents
         assert subtask.name
         assert subtask.description
         assert subtask.expected_output
@@ -133,9 +133,9 @@ async def test_recognize_multi_agent_query():
     assert len(result.subtasks) >= 1
     assert result.execution_order
 
-    available_skills = {s.id for card in agent_cards for s in card.skills}
+    available_agents = {card.name for card in agent_cards}
     for subtask in result.subtasks:
-        assert subtask.required_capability in available_skills
+        assert subtask.required_agent in available_agents
 
     order_index = {tid: idx for idx, tid in enumerate(result.execution_order)}
     for subtask in result.subtasks:
@@ -162,9 +162,9 @@ async def test_recognize_all_projects_capacity_query(capsys):
     assert result.execution_order
     assert result.reasoning
 
-    available_skills = {s.id for card in agent_cards for s in card.skills}
+    available_agents = {card.name for card in agent_cards}
     for subtask in result.subtasks:
-        assert subtask.required_capability in available_skills
+        assert subtask.required_agent in available_agents
         assert subtask.name
         assert subtask.description
         assert subtask.expected_output

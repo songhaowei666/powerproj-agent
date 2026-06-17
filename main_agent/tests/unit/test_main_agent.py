@@ -8,8 +8,8 @@ from main_agent.agent_executor import MainAgentExecutor
 from main_agent.models import MainState, TaskOutput
 from main_agent.graph import (
     build_main_graph,
-    _collect_registered_skills,
-    _find_invalid_capability_subtasks,
+    _collect_registered_agents,
+    _find_invalid_agent_subtasks,
     _resolve_clarification_prompt,
 )
 from main_agent.executor import build_task_parts, call_business_agent, extract_artifact_text
@@ -129,27 +129,25 @@ class TestClarificationPrompt:
         assert _resolve_clarification_prompt(result, "默认澄清") == "默认澄清"
 
 
-class TestCapabilityValidation:
-    """测试 required_capability 校验逻辑。"""
+class TestAgentValidation:
+    """测试 required_agent 校验逻辑。"""
 
-    def _build_mock_card(self, skill_id: str):
-        skill = MagicMock()
-        skill.id = skill_id
+    def _build_mock_card(self, agent_name: str):
         card = MagicMock()
-        card.skills = [skill]
+        card.name = agent_name
         return card
 
-    def test_collect_registered_skills(self):
+    def test_collect_registered_agents(self):
         cards = [
-            self._build_mock_card("project-query"),
-            self._build_mock_card("project-statistics"),
+            self._build_mock_card("planning-agent"),
+            self._build_mock_card("statistics-agent"),
         ]
-        assert _collect_registered_skills(cards) == {
-            "project-query",
-            "project-statistics",
+        assert _collect_registered_agents(cards) == {
+            "planning-agent",
+            "statistics-agent",
         }
 
-    def test_find_invalid_capability_subtasks(self):
+    def test_find_invalid_agent_subtasks(self):
         subtasks = [
             SubTask.model_construct(
                 id="task_1",
@@ -157,7 +155,7 @@ class TestCapabilityValidation:
                 description="查询变电容量",
                 dependencies=[],
                 expected_output="结果",
-                required_capability="",
+                required_agent="",
             ),
             SubTask(
                 id="task_2",
@@ -165,19 +163,19 @@ class TestCapabilityValidation:
                 description="统计分析",
                 dependencies=[],
                 expected_output="结果",
-                required_capability="project-statistics",
+                required_agent="statistics-agent",
             ),
             SubTask(
                 id="task_3",
                 name="未知",
-                description="未知能力",
+                description="未知 Agent",
                 dependencies=[],
                 expected_output="结果",
-                required_capability="unknown-skill",
+                required_agent="unknown-agent",
             ),
         ]
-        invalid = _find_invalid_capability_subtasks(
-            subtasks, {"project-query", "project-statistics"}
+        invalid = _find_invalid_agent_subtasks(
+            subtasks, {"planning-agent", "statistics-agent"}
         )
         assert [t.id for t in invalid] == ["task_1", "task_3"]
 
@@ -197,7 +195,7 @@ class TestBuildPhases:
                         description="任务1",
                         dependencies=[],
                         expected_output="结果1",
-                        required_capability="skill-a",
+                        required_agent="skill-a",
                         confidence=0.9,
                     ),
                     SubTask(
@@ -206,7 +204,7 @@ class TestBuildPhases:
                         description="任务2",
                         dependencies=["t1"],
                         expected_output="结果2",
-                        required_capability="skill-b",
+                        required_agent="skill-b",
                         confidence=0.9,
                     ),
                     SubTask(
@@ -215,7 +213,7 @@ class TestBuildPhases:
                         description="任务3",
                         dependencies=["t2"],
                         expected_output="结果3",
-                        required_capability="skill-c",
+                        required_agent="skill-c",
                         confidence=0.9,
                     ),
                 ],
@@ -230,32 +228,27 @@ class TestBuildPhases:
 class TestMainAgentFlow:
     """测试主控 Agent 端到端流程。"""
 
-    def _build_mock_card(self, skill_id: str, url: str = "http://localhost:8001"):
-        """构造带指定 skill 的 mock AgentCard。"""
-        skill = MagicMock()
-        skill.id = skill_id
-
+    def _build_mock_card(self, agent_name: str, url: str = "http://localhost:8001"):
+        """构造带指定 Agent 名称的 mock AgentCard。"""
         iface = MagicMock()
         iface.protocol_binding = "JSONRPC"
         iface.url = url
 
         card = MagicMock()
-        card.name = f"agent-{skill_id}"
-        card.skills = [skill]
+        card.name = agent_name
+        card.skills = []
         card.supported_interfaces = [iface]
-        skill.name = skill_id
-        skill.description = f"{skill_id} 能力"
         return card
 
-    def _register_skills(self, agent_network: AgentNetwork, skill_ids: list[str]) -> None:
+    def _register_agents(self, agent_network: AgentNetwork, agent_names: list[str]) -> None:
         """向 AgentNetwork 注册测试用 AgentCard。"""
-        cards = [self._build_mock_card(skill_id) for skill_id in skill_ids]
+        cards = [self._build_mock_card(agent_name) for agent_name in agent_names]
         agent_network._cards = cards
 
     @pytest.mark.asyncio
     async def test_full_flow_with_summarize(self, mock_llm, agent_network):
         """测试正常执行 + 总结流程。"""
-        self._register_skills(agent_network, ["data-analysis"])
+        self._register_agents(agent_network, ["statistics-agent"])
         mock_llm.ainvoke = AsyncMock(
             return_value=MagicMock(content="统计结果显示收益为 10%，表现良好。")
         )
@@ -271,7 +264,7 @@ class TestMainAgentFlow:
                     description="统计分析",
                     dependencies=[],
                     expected_output="统计结果",
-                    required_capability="data-analysis",
+                    required_agent="statistics-agent",
                     confidence=0.95,
                 )
             ],
@@ -301,14 +294,14 @@ class TestMainAgentFlow:
                     "trace": {
                         "agent_name": "statistics-agent",
                         "endpoint": "http://localhost:8003",
-                        "capability": "data-analysis",
+                        "capability": "statistics-agent",
                         "subtask": {
                             "id": "t1",
                             "name": "统计分析",
                             "description": "统计分析",
                             "dependencies": [],
                             "expected_output": "统计结果",
-                            "required_capability": "data-analysis",
+                            "required_agent": "statistics-agent",
                             "confidence": 0.95,
                         },
                         "message_parts": [{"text": "统计分析"}],
@@ -340,7 +333,7 @@ class TestMainAgentFlow:
     @pytest.mark.asyncio
     async def test_direct_reply_non_business(self, mock_llm, agent_network):
         """非业务 query 应直接 LLM 回复，不调度业务 Agent。"""
-        self._register_skills(agent_network, ["skill-a"])
+        self._register_agents(agent_network, ["skill-a"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -373,7 +366,7 @@ class TestMainAgentFlow:
     @pytest.mark.asyncio
     async def test_interrupt_uses_clarification_prompt(self, mock_llm, agent_network):
         """业务 query 模糊时应优先使用 LLM 输出的 clarification_prompt。"""
-        self._register_skills(agent_network, ["skill-a"])
+        self._register_agents(agent_network, ["skill-a"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -405,7 +398,7 @@ class TestMainAgentFlow:
     @pytest.mark.asyncio
     async def test_interrupt_low_confidence(self, mock_llm, agent_network):
         """测试低置信度触发 interrupt。"""
-        self._register_skills(agent_network, ["skill-a"])
+        self._register_agents(agent_network, ["skill-a"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -418,7 +411,7 @@ class TestMainAgentFlow:
                     description="模糊任务",
                     dependencies=[],
                     expected_output="结果",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                     confidence=0.5,
                 )
             ],
@@ -452,7 +445,7 @@ class TestMainAgentFlow:
                     description="统计收益",
                     dependencies=[],
                     expected_output="结果",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                     confidence=0.95,
                 )
             ],
@@ -483,7 +476,7 @@ class TestMainAgentFlow:
     @pytest.mark.asyncio
     async def test_parallel_execution(self, mock_llm, agent_network):
         """测试同 Phase 任务并行执行。"""
-        self._register_skills(agent_network, ["skill-a", "skill-b", "skill-c"])
+        self._register_agents(agent_network, ["skill-a", "skill-b", "skill-c"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -495,7 +488,7 @@ class TestMainAgentFlow:
                     description="统计A",
                     dependencies=[],
                     expected_output="结果A",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                     confidence=0.95,
                 ),
                 SubTask(
@@ -504,7 +497,7 @@ class TestMainAgentFlow:
                     description="投资B",
                     dependencies=[],
                     expected_output="结果B",
-                    required_capability="skill-b",
+                    required_agent="skill-b",
                     confidence=0.95,
                 ),
                 SubTask(
@@ -513,7 +506,7 @@ class TestMainAgentFlow:
                     description="规划C",
                     dependencies=["t1", "t2"],
                     expected_output="结果C",
-                    required_capability="skill-c",
+                    required_agent="skill-c",
                     confidence=0.95,
                 ),
             ],
@@ -563,7 +556,7 @@ class TestMainAgentFlow:
     @pytest.mark.asyncio
     async def test_failure_fuse(self, mock_llm, agent_network):
         """测试任务失败熔断。"""
-        self._register_skills(agent_network, ["skill-a", "skill-b"])
+        self._register_agents(agent_network, ["skill-a", "skill-b"])
         graph = build_main_graph(mock_llm, agent_network)
 
         intent_result = IntentResult(
@@ -575,7 +568,7 @@ class TestMainAgentFlow:
                     description="统计",
                     dependencies=[],
                     expected_output="结果",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                     confidence=0.95,
                 ),
                 SubTask(
@@ -584,7 +577,7 @@ class TestMainAgentFlow:
                     description="规划",
                     dependencies=["t1"],
                     expected_output="结果",
-                    required_capability="skill-b",
+                    required_agent="skill-b",
                     confidence=0.95,
                 ),
             ],
@@ -647,7 +640,7 @@ class TestBuildTaskParts:
             description="统计今年收益",
             dependencies=[],
             expected_output="结果",
-            required_capability="skill-a",
+            required_agent="skill-a",
         )
         parts = build_task_parts(subtask, {}, {"t1": subtask})
         assert parts == [{"text": "统计今年收益"}]
@@ -659,7 +652,7 @@ class TestBuildTaskParts:
             description="统计今年收益",
             dependencies=[],
             expected_output="结果A",
-            required_capability="skill-a",
+            required_agent="skill-a",
         )
         t2 = SubTask(
             id="t2",
@@ -667,12 +660,12 @@ class TestBuildTaskParts:
             description="基于统计结果做明年规划",
             dependencies=["t1"],
             expected_output="结果B",
-            required_capability="skill-b",
+            required_agent="skill-b",
         )
         task_outputs = {
             "t1": TaskOutput(
                 task_id="t1",
-                required_capability="skill-a",
+                required_agent="skill-a",
                 status="success",
                 artifacts=[{"type": "text", "text": "收益 10%"}],
             )
@@ -691,7 +684,7 @@ class TestBuildTaskParts:
             description="统计",
             dependencies=[],
             expected_output="结果",
-            required_capability="skill-a",
+            required_agent="skill-a",
         )
         t2 = SubTask(
             id="t2",
@@ -699,12 +692,12 @@ class TestBuildTaskParts:
             description="做规划",
             dependencies=["t1"],
             expected_output="结果",
-            required_capability="skill-b",
+            required_agent="skill-b",
         )
         task_outputs = {
             "t1": TaskOutput(
                 task_id="t1",
-                required_capability="skill-a",
+                required_agent="skill-a",
                 status="success",
                 artifacts=[
                     {
@@ -730,17 +723,15 @@ class TestBuildTaskParts:
 class TestExecutorRetry:
     """测试执行器重试逻辑。"""
 
-    def _build_mock_card(self, skill_id: str, url: str):
+    def _build_mock_card(self, agent_name: str, url: str):
         """构造一个 mock AgentCard。"""
-        skill = MagicMock()
-        skill.id = skill_id
-
         iface = MagicMock()
         iface.protocol_binding = "JSONRPC"
         iface.url = url
 
         card = MagicMock()
-        card.skills = [skill]
+        card.name = agent_name
+        card.skills = []
         card.supported_interfaces = [iface]
         return card
 
@@ -769,7 +760,7 @@ class TestExecutorRetry:
                     description="测试",
                     dependencies=[],
                     expected_output="ok",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                 ),
                 agent_cards=[self._build_mock_card("skill-a", "http://localhost:8001")],
                 session_id="s1",
@@ -804,7 +795,7 @@ class TestExecutorRetry:
                     description="测试",
                     dependencies=[],
                     expected_output="ok",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                 ),
                 agent_cards=[self._build_mock_card("skill-a", "http://localhost:8003")],
                 session_id="s1",
@@ -824,7 +815,7 @@ class TestExecutorRetry:
                         description="测试",
                         dependencies=[],
                         expected_output="ok",
-                        required_capability="skill-a",
+                        required_agent="skill-a",
                     ),
                     agent_cards=[self._build_mock_card("skill-a", "http://localhost:8003")],
                     session_id="s1",
@@ -840,7 +831,7 @@ class TestExecutorRetry:
             description="统计今年收益",
             dependencies=[],
             expected_output="结果A",
-            required_capability="skill-a",
+            required_agent="skill-a",
         )
         t2 = SubTask(
             id="t2",
@@ -848,12 +839,12 @@ class TestExecutorRetry:
             description="基于统计结果做明年规划",
             dependencies=["t1"],
             expected_output="结果B",
-            required_capability="skill-b",
+            required_agent="skill-b",
         )
         task_outputs = {
             "t1": TaskOutput(
                 task_id="t1",
-                required_capability="skill-a",
+                required_agent="skill-a",
                 status="success",
                 artifacts=[{"type": "text", "text": "收益 10%"}],
             )
@@ -928,7 +919,7 @@ class TestExecutorRetry:
                     description="测试",
                     dependencies=[],
                     expected_output="ok",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                 ),
                 agent_cards=[self._build_mock_card("skill-a", "http://localhost:8001")],
                 session_id="s1",
@@ -962,7 +953,7 @@ class TestExecutorRetry:
                     description="测试",
                     dependencies=[],
                     expected_output="ok",
-                    required_capability="skill-a",
+                    required_agent="skill-a",
                 ),
                 agent_cards=[self._build_mock_card("skill-a", "http://localhost:8001")],
                 session_id="s1",
@@ -976,7 +967,7 @@ class TestExecutorRetry:
             assert parts[0]["text"] == "是"
 
     @pytest.mark.asyncio
-    async def test_capability_not_found(self):
+    async def test_agent_not_found(self):
         with pytest.raises(ValueError, match="未找到支持能力"):
             await call_business_agent(
                 SubTask(
@@ -985,7 +976,7 @@ class TestExecutorRetry:
                     description="测试",
                     dependencies=[],
                     expected_output="ok",
-                    required_capability="skill-x",
+                    required_agent="skill-x",
                 ),
                 agent_cards=[self._build_mock_card("skill-a", "http://localhost:8003")],
                 session_id="s1",

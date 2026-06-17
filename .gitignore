@@ -150,3 +150,4 @@ cython_debug/
 models/
 planning_agent/planning.db
 docs/
+resume_star_project.md

@@ -14,20 +14,20 @@ class SubTask(BaseModel):
         default_factory=list, description="依赖的子任务 ID 列表"
     )
     expected_output: str = Field(..., description="预期输出描述")
-    required_capability: str = Field(
-        ..., min_length=1, description="所需 Agent 能力类型，必须匹配某个 AgentCard Skill 的 id"
+    required_agent: str = Field(
+        ..., min_length=1, description="目标业务 Agent 名称，必须匹配某个 AgentCard 的 name"
     )
     confidence: float = Field(
         default=1.0, ge=0.0, le=1.0, description="置信度 0-1"
     )
 
-    @field_validator("required_capability")
+    @field_validator("required_agent")
     @classmethod
-    def _validate_required_capability(cls, value: str) -> str:
-        """去除首尾空白，并拒绝空能力 ID。"""
+    def _validate_required_agent(cls, value: str) -> str:
+        """去除首尾空白，并拒绝空 Agent 名称。"""
         normalized = value.strip()
         if not normalized:
-            raise ValueError("required_capability 不能为空")
+            raise ValueError("required_agent 不能为空")
         return normalized
 
 

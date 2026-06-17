@@ -12,7 +12,7 @@ class InvocationTraceEntry(BaseModel):
     step: int = Field(..., description="调用序号，从 1 开始")
     agent_type: str = Field(..., description="Agent 类型：intent / business")
     agent_name: str = Field(..., description="Agent 名称")
-    capability: Optional[str] = Field(default=None, description="业务 Agent 能力 ID")
+    capability: Optional[str] = Field(default=None, description="目标业务 Agent 名称")
     phase: Optional[int] = Field(default=None, description="业务 Agent 所在执行阶段")
     task_id: Optional[str] = Field(default=None, description="子任务 ID")
     input: Dict[str, Any] = Field(default_factory=dict, description="调用入参")
@@ -24,7 +24,7 @@ class TaskOutput(BaseModel):
     """单个子任务的执行结果。"""
 
     task_id: str = Field(..., description="任务ID")
-    required_capability: str = Field(..., description="所需 Agent 能力，对应 Skill id")
+    required_agent: str = Field(..., description="目标业务 Agent 名称，对应 AgentCard.name")
     status: str = Field(..., description="执行状态：success / failed")
     artifacts: List[Dict[str, Any]] = Field(
         default_factory=list, description="业务Agent返回的artifacts"

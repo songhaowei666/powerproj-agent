@@ -54,18 +54,16 @@ DEFAULT_CLARIFICATION_VAGUE = (
 )
 
 
-def _collect_registered_skills(agent_cards: List[Any]) -> set[str]:
-    """从 AgentCard 列表中提取已注册的 skill id。"""
-    skills: set[str] = set[str]()
+def _collect_registered_agents(agent_cards: List[Any]) -> set[str]:
+    """从 AgentCard 列表中提取已注册的业务 Agent 名称。"""
+    agents: set[str] = set[str]()
     for card in agent_cards:
-        for skill in getattr(card, "skills", []):
-            if isinstance(skill, dict):
-                skill_id = skill.get("id", "")
-            else:
-                skill_id = getattr(skill, "id", "")
-            if skill_id:
-                skills.add(skill_id)
-    return skills
+        name = str(getattr(card, "name", "")).strip()
+        if isinstance(card, dict):
+            name = str(card.get("name", "")).strip()
+        if name:
+            agents.add(name)
+    return agents
 
 
 def _serialize_agent_cards_summary(agent_cards: List[Any]) -> List[Dict[str, Any]]:
@@ -174,14 +172,14 @@ async def _stream_llm_text(
     return summary_text
 
 
-def _find_invalid_capability_subtasks(
-    subtasks: List[SubTask], registered_skills: set[str]
+def _find_invalid_agent_subtasks(
+    subtasks: List[SubTask], registered_agents: set[str]
 ) -> List[SubTask]:
-    """找出 required_capability 为空或未注册的子任务。"""
+    """找出 required_agent 为空或未注册的子任务。"""
     invalid: List[SubTask] = []
     for subtask in subtasks:
-        capability = (subtask.required_capability or "").strip()
-        if not capability or capability not in registered_skills:
+        agent_name = (subtask.required_agent or "").strip()
+        if not agent_name or agent_name not in registered_agents:
             invalid.append(subtask)
     return invalid
 
@@ -214,7 +212,7 @@ def _build_summarize_user_message(state: MainState) -> str:
                 continue
             subtask = subtask_map.get(tid)
             desc = subtask.description if subtask else tid
-            lines.append(f"\n【{output.required_capability} - {desc}】")
+            lines.append(f"\n【{output.required_agent} - {desc}】")
             for art in output.artifacts:
                 text = extract_artifact_text(art)
                 if text:
@@ -242,7 +240,7 @@ def _extract_file_links(state: MainState) -> List[Dict[str, str]]:
                     links.append(
                         {
                             "task_id": tid,
-                            "required_capability": output.required_capability,
+                            "required_agent": output.required_agent,
                             "description": subtask.description if subtask else tid,
                             "url": url,
                             "name": part.get("filename") or "文件",
@@ -275,9 +273,9 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             # 缓存为空时尝试重新发现
             agent_cards = await agent_network.discover()
 
-        registered_skills = _collect_registered_skills(agent_cards)
-        capability_fix_attempts = 0
-        max_capability_fix_attempts = 2
+        registered_agents = _collect_registered_agents(agent_cards)
+        agent_fix_attempts = 0
+        max_agent_fix_attempts = 2
 
         while True:
             result = await intent_agent.recognize(state.query, agent_cards)
@@ -320,38 +318,38 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 state.query += f"\n补充信息：{clarification}"
                 continue
 
-            invalid_cap_tasks = _find_invalid_capability_subtasks(
-                result.subtasks, registered_skills
+            invalid_agent_tasks = _find_invalid_agent_subtasks(
+                result.subtasks, registered_agents
             )
-            if invalid_cap_tasks:
-                if capability_fix_attempts >= max_capability_fix_attempts:
+            if invalid_agent_tasks:
+                if agent_fix_attempts >= max_agent_fix_attempts:
                     descs = "、".join(
                         [
-                            f"{t.description}（能力={t.required_capability or '空'}）"
-                            for t in invalid_cap_tasks
+                            f"{t.description}（Agent={t.required_agent or '空'}）"
+                            for t in invalid_agent_tasks
                         ]
                     )
                     fallback = (
-                        f"无法为以下任务匹配 Agent 能力：{descs}。"
+                        f"无法为以下任务匹配业务 Agent：{descs}。"
                         "请补充更具体的业务意图，例如查询项目信息、统计分析或投资评估。"
                     )
                     question = _resolve_clarification_prompt(result, fallback)
                     clarification = interrupt({"question": question})
                     state.query += f"\n补充信息：{clarification}"
-                    capability_fix_attempts = 0
+                    agent_fix_attempts = 0
                     continue
 
                 invalid_desc = "、".join(
                     [
-                        f"{t.id}({t.required_capability or '空'})"
-                        for t in invalid_cap_tasks
+                        f"{t.id}({t.required_agent or '空'})"
+                        for t in invalid_agent_tasks
                     ]
                 )
                 state.query += (
-                    f"\n系统提示：子任务 {invalid_desc} 的 required_capability 无效，"
-                    f"请从以下能力 ID 中选取：{', '.join(sorted(registered_skills))}。"
+                    f"\n系统提示：子任务 {invalid_desc} 的 required_agent 无效，"
+                    f"请从以下 Agent 名称中选取：{', '.join(sorted(registered_agents))}。"
                 )
-                capability_fix_attempts += 1
+                agent_fix_attempts += 1
                 continue
 
             break
@@ -465,14 +463,14 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         business_task_id = result.get("business_task_id")
         while result.get("status") == "input_required":
             trace_info = result.get("trace", {})
-            agent_name = trace_info.get("agent_name", subtask.required_capability)
+            agent_name = trace_info.get("agent_name", subtask.required_agent)
             await _record_trace(
                 state,
                 InvocationTraceEntry(
                     step=0,
                     agent_type="business",
                     agent_name=agent_name,
-                    capability=subtask.required_capability,
+                    capability=subtask.required_agent,
                     phase=state.current_phase_idx,
                     task_id=tid,
                     input={
@@ -499,7 +497,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                     "parts": result.get("parts", []),
                     "subtask_id": tid,
                     "business_task_id": business_task_id,
-                    "capability": subtask.required_capability,
+                    "capability": subtask.required_agent,
                     "agent_name": agent_name,
                 }
             )
@@ -576,8 +574,8 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                             InvocationTraceEntry(
                                 step=0,
                                 agent_type="business",
-                                agent_name=subtask.required_capability,
-                                capability=subtask.required_capability,
+                                agent_name=subtask.required_agent,
+                                capability=subtask.required_agent,
                                 phase=state.current_phase_idx,
                                 task_id=tid,
                                 input={
@@ -595,7 +593,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                         )
                         state.failed_task_id = tid
                         state.error_message = (
-                            f"任务 {tid}（{subtask.required_capability}）"
+                            f"任务 {tid}（{subtask.required_agent}）"
                             f"执行失败（已重试3次）：{str(result)}"
                         )
                         state.status = "failed"
@@ -634,8 +632,8 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                         InvocationTraceEntry(
                             step=0,
                             agent_type="business",
-                            agent_name=subtask.required_capability,
-                            capability=subtask.required_capability,
+                            agent_name=subtask.required_agent,
+                            capability=subtask.required_agent,
                             phase=state.current_phase_idx,
                             task_id=input_required_tid,
                             input={"subtask": subtask.model_dump()},
@@ -646,7 +644,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                     )
                     state.failed_task_id = input_required_tid
                     state.error_message = (
-                        f"任务 {input_required_tid}（{subtask.required_capability}）"
+                        f"任务 {input_required_tid}（{subtask.required_agent}）"
                         f"执行失败（已重试3次）：{str(final_result)}"
                     )
                     state.status = "failed"
@@ -667,8 +665,8 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 InvocationTraceEntry(
                     step=0,
                     agent_type="business",
-                    agent_name=trace_info.get("agent_name", subtask.required_capability),
-                    capability=subtask.required_capability,
+                    agent_name=trace_info.get("agent_name", subtask.required_agent),
+                    capability=subtask.required_agent,
                     phase=state.current_phase_idx,
                     task_id=tid,
                     input={
@@ -684,7 +682,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             )
             state.task_outputs[tid] = TaskOutput(
                 task_id=tid,
-                required_capability=subtask.required_capability,
+                required_agent=subtask.required_agent,
                 status="success",
                 artifacts=result.get("artifacts", []),
             )
@@ -717,7 +715,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                         {
                             "type": "task_result",
                             "task_id": tid,
-                            "required_capability": output.required_capability,
+                            "required_agent": output.required_agent,
                             "artifacts": output.artifacts,
                         }
                     )
@@ -763,7 +761,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             link_lines = "\n\n相关文件："
             for link in file_links:
                 link_lines += (
-                    f"\n- {link['required_capability']}（{link['description']}）：{link['url']}"
+                    f"\n- {link['required_agent']}（{link['description']}）：{link['url']}"
                 )
             summary_text += link_lines
             if summary_publisher is not None:

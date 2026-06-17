@@ -19,12 +19,12 @@ class TestModels:
             description="查询北京西500千伏项目的基本信息",
             dependencies=[],
             expected_output="项目基本信息",
-            required_capability="project-query",
+            required_agent="planning-agent",
             confidence=0.92,
         )
         data = task.model_dump()
         assert data["id"] == "task_1"
-        assert data["required_capability"] == "project-query"
+        assert data["required_agent"] == "planning-agent"
         assert data["confidence"] == 0.92
 
     def test_intent_result_serialization(self):
@@ -38,7 +38,7 @@ class TestModels:
                     description="查询北京西500千伏项目的基本信息",
                     dependencies=[],
                     expected_output="项目基本信息",
-                    required_capability="project-query",
+                    required_agent="planning-agent",
                     confidence=0.92,
                 )
             ],
@@ -75,7 +75,7 @@ class TestModels:
                     "description": "查询项目信息",
                     "dependencies": [],
                     "expected_output": "项目信息",
-                    "required_capability": "project-query",
+                    "required_agent": "planning-agent",
                     "confidence": 0.85,
                 }
             ],
@@ -83,7 +83,7 @@ class TestModels:
             "reasoning": "用户要求规划",
         }
         result = IntentResult.model_validate(raw)
-        assert result.subtasks[0].required_capability == "project-query"
+        assert result.subtasks[0].required_agent == "planning-agent"
 
 
 class TestRagStub:
@@ -120,9 +120,8 @@ class TestPrompts:
         assert "多意图识别与任务规划专家" in prompt
         assert "is_business_query" in prompt
         assert "clarification_prompt" in prompt
-        assert "test-skill" in prompt
+        assert "test-agent" in prompt
         assert "测试能力" in prompt
-        assert "project-query" not in prompt
 
     def test_build_system_prompt_with_few_shots(self):
         agent_cards = [self._build_mock_agent_card("test-skill")]
@@ -136,7 +135,7 @@ class TestPrompts:
                         "description": "统计上季度销售数据",
                         "dependencies": [],
                         "expected_output": "销售数据报表",
-                        "required_capability": "test-skill",
+                        "required_agent": "test-agent",
                         "confidence": 0.95,
                     }
                 ],
@@ -176,7 +175,7 @@ class TestGraph:
                     description="测试任务描述",
                     dependencies=[],
                     expected_output="测试结果",
-                    required_capability="test-skill",
+                    required_agent="test-agent",
                     confidence=0.9,
                 )
             ],
@@ -217,7 +216,7 @@ class TestAgent:
                     description="测试任务描述",
                     dependencies=[],
                     expected_output="测试结果",
-                    required_capability="test-skill",
+                    required_agent="test-agent",
                     confidence=0.88,
                 )
             ],
@@ -235,4 +234,4 @@ class TestAgent:
 
         assert isinstance(result, IntentResult)
         assert len(result.subtasks) == 1
-        assert result.subtasks[0].required_capability == "test-skill"
+        assert result.subtasks[0].required_agent == "test-agent"

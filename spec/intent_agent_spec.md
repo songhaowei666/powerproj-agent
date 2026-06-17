@@ -7,7 +7,7 @@
 改造目标：
 
 - 参考 `examples/agents/task_planning_and_dispatch` 的任务规划与调度设计
-- 在提示词中注入各业务 Agent 的能力列表（AgentCard.skills）
+- 在提示词中注入各业务 Agent 列表（AgentCard.name / description，skills 仅作业务能力说明）
 - 输出从"业务类型任务列表"升级为"带执行顺序的子任务规划"
 
 ## 2. 术语
@@ -16,9 +16,9 @@
 |------|------|
 | AgentCard | A2A 协议中描述 Agent 元数据与能力的卡片 |
 | Skill | AgentCard 中定义的单个能力，含 `id/name/description/tags/examples` |
-| 子任务 | 可由单个 Agent 能力独立完成的最小执行单元 |
+| 子任务 | 可由单个业务 Agent 独立完成的最小执行单元 |
 | 执行顺序 | 按依赖关系拓扑排序后的子任务 ID 序列 |
-| 能力匹配 | 子任务的 `required_capability` 必须对应某个 AgentCard Skill 的 `id` |
+| Agent 匹配 | 子任务的 `required_agent` 必须对应某个 AgentCard 的 `name` |
 
 ## 3. 输入输出
 
@@ -65,7 +65,7 @@
       "description": "根据项目名称查询北京西500千伏项目的基本信息及节点状态",
       "dependencies": [],
       "expected_output": "北京西500千伏项目的基本信息，包括项目编码、电压等级、节点状态等",
-      "required_capability": "project-query"
+      "required_agent": "planning-agent"
     },
     {
       "id": "task_2",
@@ -73,7 +73,7 @@
       "description": "根据查询到的项目信息，定位并下载可研设计节点（001）的文件",
       "dependencies": ["task_1"],
       "expected_output": "北京西500千伏项目可研设计节点的文件下载结果或文件链接",
-      "required_capability": "file-management"
+      "required_agent": "planning-agent"
     }
   ],
   "execution_order": ["task_1", "task_2"],
@@ -100,8 +100,8 @@ class SubTask(BaseModel):
         default_factory=list, description="依赖的子任务 ID 列表"
     )
     expected_output: str = Field(..., description="预期输出描述")
-    required_capability: str = Field(
-        ..., description="所需 Agent 能力类型，必须匹配某个 AgentCard Skill 的 id"
+    required_agent: str = Field(
+        ..., description="目标业务 Agent 名称，必须匹配某个 AgentCard 的 name"
     )
 
 
@@ -157,7 +157,7 @@ class IntentAgent:
 
 - `query`: 用户输入的自然语言查询
 - `agent_cards`: 可用业务 Agent 的 AgentCard 对象序列，支持 protobuf 风格与 dataclass 风格
-- 返回 `IntentResult`，其中每个子任务的 `required_capability` 必须能匹配到 `agent_cards` 中某个 Skill 的 `id`
+- 返回 `IntentResult`，其中每个子任务的 `required_agent` 必须能匹配到 `agent_cards` 中某个 Agent 的 `name`
 - LLM 实例由 `providers/` 目录统一管理，通过构造函数注入 `IntentAgent`
 
 ### 4.4 prompts.py
@@ -171,7 +171,7 @@ def build_system_prompt(
 ) -> str
 ```
 
-- 从 `agent_cards` 中提取所有 Skill，格式化为 `agent_capabilities` 文本
+- 从 `agent_cards` 中提取业务 Agent 信息，格式化为 `agent_list` 文本（skills 聚合为业务能力说明）
 - 将 `agent_capabilities` 注入 system prompt
 
 ## 5. LangGraph 状态图
@@ -214,7 +214,7 @@ System prompt 模板结构：
 2. 完整性：所有子任务的组合必须能够完成原始任务目标
 3. 有序性：明确标注子任务之间的依赖关系和执行顺序
 4. 可验证性：每个子任务应有明确的完成标准
-5. 能力匹配：每个子任务的 required_capability 必须从下方可用能力列表中选取
+5. Agent 匹配：每个子任务的 required_agent 必须从下方可用业务 Agent 列表中选取
 
 ## 可用 Agent 能力列表
 {agent_capabilities}
@@ -225,10 +225,10 @@ System prompt 模板结构：
 ## 输出要求
 - 仔细分析用户 query，识别其中涉及的一个或多个业务意图
 - 将每个意图拆分为可由单个 Agent 能力完成的子任务
-- 每个子任务必须包含：id, name, description, dependencies, expected_output, required_capability
+- 每个子任务必须包含：id, name, description, dependencies, expected_output, required_agent
 - id 从 task_1 开始顺序编号，如 task_1, task_2, task_3
 - dependencies 使用前置子任务的 id 列表表示依赖关系，无依赖则为空列表 []
-- required_capability 必须匹配上方可用能力列表中的某个 skill id
+- required_agent 必须匹配上方可用业务 Agent 列表中的某个 Agent 名称（AgentCard.name）
 - 如果多个子任务之间存在先后依赖关系，请在 dependencies 中正确声明
 - description 用一句话概括该子任务的具体内容
 - expected_output 说明该子任务完成后应产生的具体结果
@@ -243,31 +243,27 @@ System prompt 模板结构：
 {user_query}
 ```
 
-### 6.1 AgentCard 能力提取格式
+### 6.1 AgentCard 列表提取格式
 
-从 AgentCard 的 `skills` 中提取每个 skill，格式如下：
+从 AgentCard 提取每个业务 Agent，格式如下：
 
 ```
-- `{skill_id}` — {skill_name}
-  所属Agent：{agent_name}
-  描述：{skill_description}
-  标签：{tags}
-  示例：{examples}
+- `{agent_name}` — {agent_description}
+  业务能力：
+  {skill_name}：{skill_description}（示例：...）
 ```
 
 示例：
 
 ```
-- `data-analysis` — 数据分析
-  所属Agent：statistics-agent
-  描述：对业务数据进行描述性统计和趋势分析
-  标签：statistics, analysis
-  示例：分析上月销售数据；统计用户留存率变化趋势
+- `statistics-agent` — 统计业务 Agent，负责电力项目的规模统计、排名分析与指标对比
+  业务能力：
+  项目统计指标：根据项目编码或项目名称查询具体电力项目...（示例：统计 PRJ001 的指标）
 ```
 
 ## 7. 关键约束
 
-1. **能力必须可匹配**：`SubTask.required_capability` 必须是某个 `AgentCard.Skill.id`
+1. **Agent 必须可匹配**：`SubTask.required_agent` 必须是某个 `AgentCard.name`
 2. **执行顺序必须有效**：`execution_order` 必须满足所有 `dependencies` 的拓扑约束
 3. **支持 protobuf 与 dataclass 两种 AgentCard**：能力提取函数需通过 `getattr` 兼容访问
 4. **RAG 完全 stub 化**：`rag_stub.py` 返回空列表，后续替换实现即可，不侵入主逻辑
@@ -303,7 +299,7 @@ intent_agent/
 
 1. **LangGraph 状态图保持 2 个节点**：`retrieve → plan`，无路由分支，保持极简
 2. **AgentCard 能力注入 prompt**：意图识别阶段即考虑实际可用 Agent 能力，避免规划出无法执行的任务
-3. **子任务使用 `required_capability` 而非业务类型**：更贴近 A2A Skill 模型，便于主控 Agent 直接根据 skill id 选择目标 Agent
+3. **子任务使用 `required_agent` 路由到业务 Agent**：业务 Agent 对外是黑盒，具体使用哪个内部 Skill 由 Agent 自行决定；主控只负责路由到正确的 endpoint
 4. **保留 `reasoning` 字段**：意图识别需要解释多意图拆分与依赖关系的原因
 5. **少样本直接拼接 system prompt**：在 `prompts.py` 中组装，不依赖 LangChain 的 FewShotPromptTemplate，保持可控性
 
