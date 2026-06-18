@@ -232,7 +232,6 @@ class TestBuildPhases:
                         dependencies=[],
                         expected_output="结果1",
                         required_agent="skill-a",
-                        confidence=0.9,
                     ),
                     SubTask(
                         id="t2",
@@ -241,7 +240,6 @@ class TestBuildPhases:
                         dependencies=["t1"],
                         expected_output="结果2",
                         required_agent="skill-b",
-                        confidence=0.9,
                     ),
                     SubTask(
                         id="t3",
@@ -250,7 +248,6 @@ class TestBuildPhases:
                         dependencies=["t2"],
                         expected_output="结果3",
                         required_agent="skill-c",
-                        confidence=0.9,
                     ),
                 ],
                 execution_order=["t1", "t2", "t3"],
@@ -294,7 +291,6 @@ class TestPlanConfirm:
                     dependencies=[],
                     expected_output="统计结果",
                     required_agent="statistics-agent",
-                    confidence=0.95,
                 )
             ],
             execution_order=["t1"],
@@ -337,7 +333,6 @@ class TestPlanConfirm:
                     dependencies=[],
                     expected_output="统计结果",
                     required_agent="statistics-agent",
-                    confidence=0.95,
                 )
             ],
             execution_order=["t1"],
@@ -379,7 +374,6 @@ class TestPlanConfirm:
                     dependencies=[],
                     expected_output="统计结果",
                     required_agent="statistics-agent",
-                    confidence=0.95,
                 ),
                 SubTask(
                     id="t2",
@@ -388,7 +382,6 @@ class TestPlanConfirm:
                     dependencies=["t1"],
                     expected_output="文件",
                     required_agent="statistics-agent",
-                    confidence=0.95,
                 ),
             ],
             execution_order=["t1", "t2"],
@@ -404,7 +397,6 @@ class TestPlanConfirm:
                     dependencies=[],
                     expected_output="统计结果",
                     required_agent="statistics-agent",
-                    confidence=0.95,
                 )
             ],
             execution_order=["t1"],
@@ -478,7 +470,6 @@ class TestMainAgentFlow:
                     dependencies=[],
                     expected_output="统计结果",
                     required_agent="statistics-agent",
-                    confidence=0.95,
                 )
             ],
             execution_order=["t1"],
@@ -515,7 +506,6 @@ class TestMainAgentFlow:
                             "dependencies": [],
                             "expected_output": "统计结果",
                             "required_agent": "statistics-agent",
-                            "confidence": 0.95,
                         },
                         "message_parts": [{"text": "统计分析"}],
                         "request": {"method": "SendMessage"},
@@ -610,8 +600,10 @@ class TestMainAgentFlow:
         )
 
     @pytest.mark.asyncio
-    async def test_interrupt_low_confidence(self, mock_llm, agent_network):
-        """测试低置信度触发 interrupt。"""
+    async def test_goes_to_plan_confirm_without_clarification(
+        self, mock_llm, agent_network
+    ):
+        """有子任务且无 clarification_prompt 时应进入 plan_confirm。"""
         self._register_agents(agent_network, ["skill-a"])
         graph = build_main_graph(mock_llm, agent_network)
 
@@ -626,7 +618,6 @@ class TestMainAgentFlow:
                     dependencies=[],
                     expected_output="结果",
                     required_agent="skill-a",
-                    confidence=0.5,
                 )
             ],
             execution_order=["t1"],
@@ -638,20 +629,29 @@ class TestMainAgentFlow:
             new_callable=AsyncMock,
             return_value=intent_result,
         ):
-            result = await graph.ainvoke(
-                MainState(query="帮我弄一下"),
-                {"configurable": {"thread_id": "test-2"}},
-            )
+            with patch(
+                "main_agent.graph.call_business_agent",
+                new_callable=AsyncMock,
+            ) as mock_call:
+                result = await graph.ainvoke(
+                    MainState(query="帮我弄一下"),
+                    {"configurable": {"thread_id": "test-low-conf-plan"}},
+                )
 
-        # 应该返回 interrupt 信息
         assert "__interrupt__" in result
-        interrupt_info = result["__interrupt__"][0]
-        assert "question" in interrupt_info.value
+        interrupt_info = result["__interrupt__"][0].value
+        assert interrupt_info["type"] == "plan_confirm"
+        mock_call.assert_not_called()
 
-        # 模拟恢复：用户补充信息后重新识别（此时置信度足够）
-        intent_result_ok = IntentResult(
+    @pytest.mark.asyncio
+    async def test_clarification_prompt_with_subtasks(self, mock_llm, agent_network):
+        """Intent 返回 clarification_prompt 时仍应先澄清，不进入 plan_confirm。"""
+        self._register_agents(agent_network, ["skill-a"])
+        graph = build_main_graph(mock_llm, agent_network)
+
+        intent_result = IntentResult(
             is_business_query=True,
-            task_goal="统计收益",
+            task_goal="统计请求",
             subtasks=[
                 SubTask(
                     id="t1",
@@ -660,7 +660,41 @@ class TestMainAgentFlow:
                     dependencies=[],
                     expected_output="结果",
                     required_agent="skill-a",
-                    confidence=0.95,
+                )
+            ],
+            execution_order=["t1"],
+            reasoning="测试",
+            clarification_prompt="请问您要统计哪个时间范围？",
+        )
+
+        with patch(
+            "intent_agent.agent.IntentAgent.recognize",
+            new_callable=AsyncMock,
+            return_value=intent_result,
+        ):
+            result = await graph.ainvoke(
+                MainState(query="帮我统计"),
+                {"configurable": {"thread_id": "test-clarify-with-subtasks"}},
+            )
+
+        assert "__interrupt__" in result
+        interrupt_info = result["__interrupt__"][0].value
+        assert interrupt_info.get("type") != "plan_confirm"
+        assert (
+            interrupt_info["question"] == "请问您要统计哪个时间范围？"
+        )
+
+        intent_result_ok = IntentResult(
+            is_business_query=True,
+            task_goal="统计收益",
+            subtasks=[
+                SubTask(
+                    id="t1",
+                    name="统计收益",
+                    description="统计2025年投资收益",
+                    dependencies=[],
+                    expected_output="结果",
+                    required_agent="skill-a",
                 )
             ],
             execution_order=["t1"],
@@ -677,16 +711,13 @@ class TestMainAgentFlow:
                 new_callable=AsyncMock,
                 return_value={"status": "success", "artifacts": [{"type": "text", "text": "结果"}]},
             ):
-                from langgraph.types import Command
-
                 result2 = await _invoke_with_plan_approval(
                     graph,
-                    Command(resume="我想统计今年的投资收益"),
-                    {"configurable": {"thread_id": "test-2"}},
+                    Command(resume="2025年"),
+                    {"configurable": {"thread_id": "test-clarify-with-subtasks"}},
                 )
 
         assert result2["status"] == "completed"
-        assert "模糊任务" not in result2.get("summary", "")
 
     @pytest.mark.asyncio
     async def test_parallel_execution(self, mock_llm, agent_network):
@@ -704,7 +735,6 @@ class TestMainAgentFlow:
                     dependencies=[],
                     expected_output="结果A",
                     required_agent="skill-a",
-                    confidence=0.95,
                 ),
                 SubTask(
                     id="t2",
@@ -713,7 +743,6 @@ class TestMainAgentFlow:
                     dependencies=[],
                     expected_output="结果B",
                     required_agent="skill-b",
-                    confidence=0.95,
                 ),
                 SubTask(
                     id="t3",
@@ -722,7 +751,6 @@ class TestMainAgentFlow:
                     dependencies=["t1", "t2"],
                     expected_output="结果C",
                     required_agent="skill-c",
-                    confidence=0.95,
                 ),
             ],
             execution_order=["t1", "t2", "t3"],
@@ -785,7 +813,6 @@ class TestMainAgentFlow:
                     dependencies=[],
                     expected_output="结果",
                     required_agent="skill-a",
-                    confidence=0.95,
                 ),
                 SubTask(
                     id="t2",
@@ -794,7 +821,6 @@ class TestMainAgentFlow:
                     dependencies=["t1"],
                     expected_output="结果",
                     required_agent="skill-b",
-                    confidence=0.95,
                 ),
             ],
             execution_order=["t1", "t2"],

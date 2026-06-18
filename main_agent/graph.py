@@ -11,6 +11,7 @@ from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
+from config.settings import settings
 from intent_agent.agent import IntentAgent
 from intent_agent.models import IntentResult, SubTask
 from main_agent.agent_network import AgentNetwork
@@ -299,7 +300,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
     async def recognize_and_check(
         state: MainState, config: RunnableConfig
     ) -> MainState:
-        """调用意图识别，检查置信度，不足时 interrupt 等待用户补充。"""
+        """调用意图识别，检查澄清条件，不足时 interrupt 等待用户补充。"""
         agent_cards = agent_network.get_cards()
         if not agent_cards:
             # 缓存为空时尝试重新发现
@@ -307,7 +308,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
 
         registered_agents = _collect_registered_agents(agent_cards)
         agent_fix_attempts = 0
-        max_agent_fix_attempts = 2
+        max_agent_fix_attempts = settings.main_agent_agent_fix_max_attempts
 
         while True:
             result = await intent_agent.recognize(state.query, agent_cards)
@@ -339,13 +340,10 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 state.query += f"\n补充信息：{clarification}"
                 continue
 
-            low_conf_tasks = [t for t in result.subtasks if t.confidence < 0.8]
-            if low_conf_tasks:
-                descs = "、".join(
-                    [f"{t.description}（置信度{t.confidence:.2f}）" for t in low_conf_tasks]
+            if (result.clarification_prompt or "").strip():
+                question = _resolve_clarification_prompt(
+                    result, DEFAULT_CLARIFICATION_VAGUE
                 )
-                fallback = f"以下任务置信度较低，请补充相关信息：{descs}"
-                question = _resolve_clarification_prompt(result, fallback)
                 clarification = interrupt({"question": question})
                 state.query += f"\n补充信息：{clarification}"
                 continue

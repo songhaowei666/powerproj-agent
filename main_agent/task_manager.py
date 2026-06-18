@@ -57,7 +57,6 @@ def _managed_task_from_subtask(subtask: SubTask) -> ManagedTask:
         dependencies=list(subtask.dependencies),
         expected_output=subtask.expected_output,
         required_agent=subtask.required_agent,
-        confidence=subtask.confidence,
         status="pending",
     )
 

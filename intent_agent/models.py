@@ -17,9 +17,6 @@ class SubTask(BaseModel):
     required_agent: str = Field(
         ..., min_length=1, description="目标业务 Agent 名称，必须匹配某个 AgentCard 的 name"
     )
-    confidence: float = Field(
-        default=1.0, ge=0.0, le=1.0, description="置信度 0-1"
-    )
 
     @field_validator("required_agent")
     @classmethod

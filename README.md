@@ -33,7 +33,7 @@ flowchart TB
 
 1. **Agent 网络发现**：主控 Agent 启动时拉取下游 Agent Card，构建可用 Skill 能力列表
 2. **意图识别**：将自然语言 query 解析为带依赖关系与 `required_capability` 的子任务规划
-3. **置信度与能力补全**：任务为空、任意任务置信度 < 0.8、或 `required_capability` 为空/未注册时，通过 `interrupt` 暂停并返回 `input-required`，等待用户补充后重新识别
+3. **澄清与计划确认**：任务为空、`clarification_prompt` 非空、或 `required_agent` 无效时澄清；否则进入计划确认（`plan_confirm`），用户确认后再执行
 4. **分阶段并行**：按 DAG 拓扑分层，同层任务 `asyncio.gather` 并行，层间串行
 5. **失败熔断**：单任务最多重试 3 次，任一任务最终失败则终止后续 Phase
 6. **结果汇总**：LLM 生成自然语言总结，并保留各业务 Agent 原始 artifacts

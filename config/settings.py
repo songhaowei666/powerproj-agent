@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # Embedding
     embedding_model: str = "text-embedding-3-large"
 
+    # 主控 Agent
+    main_agent_agent_fix_max_attempts: int = 1
+
     # 可选第三方服务
     gemini_api_key: str = ""
     jina_api_key: str = ""

@@ -20,12 +20,10 @@ class TestModels:
             dependencies=[],
             expected_output="项目基本信息",
             required_agent="planning-agent",
-            confidence=0.92,
         )
         data = task.model_dump()
         assert data["id"] == "task_1"
         assert data["required_agent"] == "planning-agent"
-        assert data["confidence"] == 0.92
 
     def test_intent_result_serialization(self):
         result = IntentResult(
@@ -39,7 +37,6 @@ class TestModels:
                     dependencies=[],
                     expected_output="项目基本信息",
                     required_agent="planning-agent",
-                    confidence=0.92,
                 )
             ],
             execution_order=["task_1"],
@@ -76,7 +73,6 @@ class TestModels:
                     "dependencies": [],
                     "expected_output": "项目信息",
                     "required_agent": "planning-agent",
-                    "confidence": 0.85,
                 }
             ],
             "execution_order": ["task_1"],
@@ -136,7 +132,6 @@ class TestPrompts:
                         "dependencies": [],
                         "expected_output": "销售数据报表",
                         "required_agent": "test-agent",
-                        "confidence": 0.95,
                     }
                 ],
             }
@@ -176,7 +171,6 @@ class TestGraph:
                     dependencies=[],
                     expected_output="测试结果",
                     required_agent="test-agent",
-                    confidence=0.9,
                 )
             ],
             execution_order=["task_1"],
@@ -217,7 +211,6 @@ class TestAgent:
                     dependencies=[],
                     expected_output="测试结果",
                     required_agent="test-agent",
-                    confidence=0.88,
                 )
             ],
             execution_order=["task_1"],

@@ -150,7 +150,6 @@ class ManagedTask(BaseModel):
     dependencies: List[str] = []
     expected_output: str
     required_agent: str
-    confidence: float = 1.0
     status: str = "pending"          # ManagedTaskStatus
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -325,14 +324,14 @@ START
 
 | 场景 | interrupt 类型 | 触发条件 |
 |------|----------------|----------|
-| 澄清 | `clarification`（现有） | 无 subtasks、置信度 < 0.8、required_agent 无效 |
+| 澄清 | `clarification`（现有） | 无 subtasks、`clarification_prompt` 非空、required_agent 无效 |
 | 计划确认 | `plan_confirm`（新增） | subtasks 非空、校验通过、尚未 approved |
 
 **规则**：澄清发生在计划之前；计划确认发生在执行之前。二者互斥——只有计划就绪后才展示 `plan_confirm`。
 
 ### 6.4 默认产品策略
 
-1. **即使仅 1 个子任务且置信度为 1.0，仍走 plan_confirm**（体验统一）
+1. **即使仅 1 个子任务，仍走 plan_confirm**（体验统一）
 2. **M1 修改计划**：用户以文本描述修改意图 → 重新 Intent → revision +1 → 再次 plan_confirm
 3. **M1 取消**：整单取消，不做「跳过单个子任务继续跑」（M4 再评估）
 

@@ -31,7 +31,6 @@ class ManagedTask(BaseModel):
     dependencies: List[str] = Field(default_factory=list)
     expected_output: str
     required_agent: str
-    confidence: float = 1.0
     status: str = "pending"
     started_at: Optional[str] = None
     completed_at: Optional[str] = None

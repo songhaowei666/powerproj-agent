@@ -6,7 +6,7 @@
 
 1. **Agent 网络管理**：通过 `AgentNetwork` 发现和维护下游业务 Agent，统一拉取各 Agent 的 AgentCard
 2. **意图识别**：调度意图识别 Agent，基于当前 Agent 网络中的全部 AgentCard 对 user query 进行意图解析与任务规划
-3. **置信度检查与补全循环**：当任务为空、任意子任务置信度 < 0.8、或 `required_agent` 为空/未注册时，向用户发起澄清提问或自动重试识别，直到满足条件
+3. **澄清与补全循环**：当任务为空、`clarification_prompt` 非空、或 `required_agent` 为空/未注册时，向用户发起澄清提问或自动重试识别；有子任务且信息充分时进入计划确认
 4. **分阶段并行调度**：根据子任务依赖关系构建 DAG，按拓扑分层，同层任务并行执行，层间串行
 5. **失败重试与熔断**：每个任务最多重试 3 次，任一任务最终失败即终止整个流程并返回错误
 6. 透传业务 Agent 返回的文本与文件下载链接
@@ -26,7 +26,7 @@
 | Skill | AgentCard 中定义的单个能力，含 `id/name/description/tags/examples` |
 | SubTask | 意图识别输出的子任务，包含 `id/name/description/dependencies/expected_output/required_agent` |
 | Phase | 执行阶段。按依赖拓扑分层后，同一层无依赖关系的任务构成一个 Phase |
-| 置信度补全循环 | 当识别结果不满足置信度阈值时，通过 `interrupt` 暂停图执行，等待用户补充信息后恢复并重新识别 |
+| 澄清补全循环 | 当识别结果缺少子任务或存在 `clarification_prompt` 时，通过 `interrupt` 暂停图执行，等待用户补充信息后恢复并重新识别 |
 | 任务熔断 | 某个任务重试 3 次仍失败后，立即停止后续所有 Phase 的执行 |
 
 ## 3. 输入输出
@@ -98,11 +98,11 @@
     "state": "input-required",
     "message": {
       "role": "agent",
-      "parts": [{"type": "text", "text": "以下任务置信度较低，请补充相关信息：..."}]
+      "parts": [{"type": "text", "text": "请问您想查询哪个项目？请补充更多细节..."}]
     }
   },
   "artifacts": [
-    {"type": "text", "text": "以下任务置信度较低，请补充相关信息：..."}
+    {"type": "text", "text": "请问您想查询哪个项目？请补充更多细节..."}
   ]
 }
 ```
@@ -328,7 +328,7 @@ def build_main_graph(
     构建主控 LangGraph。
 
     节点：
-    - recognize_and_check: 从 AgentNetwork 获取 AgentCard，调用 intent_agent，检查置信度，不足时 interrupt 等待用户补充
+    - recognize_and_check: 从 AgentNetwork 获取 AgentCard，调用 intent_agent，检查澄清条件，不足时 interrupt 等待用户补充
     - build_phases: 根据 dependencies 拓扑排序分 Phase
     - execute_current_phase: 并行调用当前 Phase 的所有业务 Agent
     - finalize: 组装最终结果或失败信息
@@ -409,9 +409,8 @@ async def recognize_and_check(state: MainState) -> MainState:
             state.query += f"\n补充信息：{clarification}"
             continue
 
-        low_conf_tasks = [t for t in result.subtasks if t.confidence < 0.8]
-        if low_conf_tasks:
-            question = result.clarification_prompt or "低置信度默认模板"
+        if (result.clarification_prompt or "").strip():
+            question = result.clarification_prompt or "默认澄清模板"
             clarification = interrupt({"question": question})
             state.query += f"\n补充信息：{clarification}"
             continue

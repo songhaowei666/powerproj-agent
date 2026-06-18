@@ -17,7 +17,6 @@ def _build_intent_result() -> IntentResult:
                 dependencies=[],
                 expected_output="项目基本信息",
                 required_agent="planning-agent",
-                confidence=0.95,
             ),
             SubTask(
                 id="task_2",
@@ -26,7 +25,6 @@ def _build_intent_result() -> IntentResult:
                 dependencies=["task_1"],
                 expected_output="文件链接",
                 required_agent="planning-agent",
-                confidence=0.95,
             ),
         ],
         execution_order=["task_1", "task_2"],
