@@ -70,13 +70,41 @@ def parse_plan_confirm_action(user_reply: str) -> str:
     text = (user_reply or "").strip()
     if not text:
         return "unknown"
-    if text in {"确认执行", "开始执行"}:
+    if text in {"确认执行", "开始执行"} or text.startswith("确认执行:"):
         return "approve"
     if text == "取消":
         return "cancel"
     if text.startswith("修改计划"):
         return "modify"
     return "unknown"
+
+
+def parse_plan_approve_selection(user_reply: str) -> Optional[List[str]]:
+    """解析计划确认时用户勾选的子任务 ID 列表。
+
+    Returns:
+        None 表示全选；非空列表表示部分选中；空列表表示未选任何任务。
+    """
+    text = (user_reply or "").strip()
+    if text in {"确认执行", "开始执行"}:
+        return None
+    prefix = "确认执行:"
+    if not text.startswith(prefix):
+        return None
+    raw_ids = text[len(prefix) :].strip()
+    if not raw_ids:
+        return []
+    return [item.strip() for item in raw_ids.split(",") if item.strip()]
+
+
+def format_plan_approve_reply(
+    selected_task_ids: List[str],
+    all_task_ids: List[str],
+) -> str:
+    """构建带勾选结果的确认执行回复文本。"""
+    if set(selected_task_ids) == set(all_task_ids):
+        return "确认执行"
+    return f"确认执行:{','.join(selected_task_ids)}"
 
 
 def extract_plan_modify_text(user_reply: str) -> str:
@@ -116,6 +144,19 @@ class TaskManager:
         updated.plan_status = "approved"
         updated.approved_at = _utc_now_iso()
         _append_event(updated, "plan_approved", message="用户已确认执行计划")
+        return updated
+
+    @staticmethod
+    def apply_task_selection(
+        plan: ManagedTaskPlan,
+        selected_task_ids: List[str],
+    ) -> ManagedTaskPlan:
+        """将未勾选的 pending 子任务标记为 skipped。"""
+        selected_set = set(selected_task_ids)
+        updated = _clone_plan(plan)
+        for task in updated.tasks:
+            if task.id not in selected_set and task.status == "pending":
+                task.status = "skipped"
         return updated
 
     @staticmethod

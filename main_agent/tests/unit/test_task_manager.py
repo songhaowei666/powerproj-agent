@@ -2,7 +2,12 @@
 
 from intent_agent.models import IntentResult, SubTask
 
-from main_agent.task_manager import TaskManager, parse_plan_confirm_action
+from main_agent.task_manager import (
+    TaskManager,
+    format_plan_approve_reply,
+    parse_plan_approve_selection,
+    parse_plan_confirm_action,
+)
 from main_agent.task_models import ManagedTaskPlan
 
 
@@ -107,8 +112,30 @@ class TestTaskManager:
 
     def test_parse_plan_confirm_action(self):
         assert parse_plan_confirm_action("确认执行") == "approve"
+        assert parse_plan_confirm_action("确认执行:task_1,task_2") == "approve"
         assert parse_plan_confirm_action("取消") == "cancel"
         assert parse_plan_confirm_action("修改计划：不要下载") == "modify"
+
+    def test_parse_plan_approve_selection(self):
+        assert parse_plan_approve_selection("确认执行") is None
+        assert parse_plan_approve_selection("确认执行:task_1,task_2") == [
+            "task_1",
+            "task_2",
+        ]
+        assert parse_plan_approve_selection("确认执行:") == []
+
+    def test_format_plan_approve_reply(self):
+        assert format_plan_approve_reply(["task_1", "task_2"], ["task_1", "task_2"]) == "确认执行"
+        assert (
+            format_plan_approve_reply(["task_1"], ["task_1", "task_2"])
+            == "确认执行:task_1"
+        )
+
+    def test_apply_task_selection(self):
+        plan = TaskManager.create_plan_from_intent(_build_intent_result())
+        updated = TaskManager.apply_task_selection(plan, ["task_1"])
+        assert updated.tasks[0].status == "pending"
+        assert updated.tasks[1].status == "skipped"
 
     def test_build_cancel_message(self):
         plan = TaskManager.create_plan_from_intent(_build_intent_result())

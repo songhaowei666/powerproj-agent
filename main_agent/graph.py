@@ -19,6 +19,7 @@ from main_agent.models import MainState, TaskOutput, InvocationTraceEntry
 from main_agent.task_manager import (
     TaskManager,
     parse_plan_confirm_action,
+    parse_plan_approve_selection,
     extract_plan_modify_text,
     PLAN_CONFIRM_QUESTION,
 )
@@ -469,6 +470,18 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             return state
 
         if action == "approve":
+            selected_ids = parse_plan_approve_selection(str(user_reply))
+            if selected_ids is not None:
+                if not selected_ids:
+                    state.task_plan = TaskManager.cancel_plan(
+                        state.task_plan, "未选择任何子任务"
+                    )
+                    state.status = "cancelled"
+                    await _publish_task_progress(state, config)
+                    return state
+                state.task_plan = TaskManager.apply_task_selection(
+                    state.task_plan, selected_ids
+                )
             state.task_plan = TaskManager.approve_plan(state.task_plan)
             await _publish_task_progress(state, config)
             return state
@@ -510,7 +523,15 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
             return state
 
         state.task_plan = TaskManager.start_execution(state.task_plan)
-        subtasks = state.intent_result.subtasks
+        subtasks = list(state.intent_result.subtasks)
+        if state.task_plan is not None:
+            skipped_ids = {
+                task.id
+                for task in state.task_plan.tasks
+                if task.status == "skipped"
+            }
+            if skipped_ids:
+                subtasks = [item for item in subtasks if item.id not in skipped_ids]
         task_ids = {t.id for t in subtasks}
 
         # 计算入度与依赖关系

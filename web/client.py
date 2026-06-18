@@ -15,7 +15,10 @@ from main_agent.streaming import (
     parse_summary_chunk_message,
     parse_trace_step_message,
 )
-from a2a_message_parser import parse_confirmation_from_parts
+from a2a_message_parser import (
+    parse_confirmation_from_parts,
+    parse_plan_confirm_from_parts,
+)
 
 
 @dataclass
@@ -32,11 +35,13 @@ class StreamEvent:
 
 @dataclass
 class ConfirmationUI:
-    """结构化确认交互（是/否等按钮）。"""
+    """结构化确认交互（是/否、计划勾选等）。"""
 
     action: str
     options: List[Dict[str, str]]
     title: str = ""
+    confirm_type: str = "confirmation"
+    body: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -287,16 +292,10 @@ def _extract_invocation_traces_from_artifacts(
     return traces
 
 
-def _build_confirmation_ui(
-    parts: List[Dict[str, Any]],
-) -> Optional[ConfirmationUI]:
-    """从 parts 中解析 confirmation 交互定义。"""
-    data = parse_confirmation_from_parts(parts)
-    if not data:
-        return None
-    options = data.get("options") or []
-    if not options:
-        return None
+def _normalize_confirmation_options(
+    options: List[Any],
+) -> List[Dict[str, str]]:
+    """规范化 confirmation / plan_confirm 的按钮选项。"""
     normalized_options: List[Dict[str, str]] = []
     for option in options:
         if not isinstance(option, dict):
@@ -311,12 +310,38 @@ def _build_confirmation_ui(
                     "replyText": reply_text or label,
                 }
             )
+    return normalized_options
+
+
+def _build_confirmation_ui(
+    parts: List[Dict[str, Any]],
+) -> Optional[ConfirmationUI]:
+    """从 parts 中解析 confirmation 或 plan_confirm 交互定义。"""
+    plan_data = parse_plan_confirm_from_parts(parts)
+    if plan_data:
+        normalized_options = _normalize_confirmation_options(plan_data.get("options") or [])
+        if not normalized_options:
+            return None
+        return ConfirmationUI(
+            action=str(plan_data.get("action", "plan_confirm")),
+            title=str(plan_data.get("title", "")),
+            options=normalized_options,
+            confirm_type="plan_confirm",
+            body=plan_data.get("body") if isinstance(plan_data.get("body"), dict) else None,
+        )
+
+    data = parse_confirmation_from_parts(parts)
+    if not data:
+        return None
+    normalized_options = _normalize_confirmation_options(data.get("options") or [])
     if not normalized_options:
         return None
     return ConfirmationUI(
         action=str(data.get("action", "")),
         title=str(data.get("title", "")),
         options=normalized_options,
+        confirm_type="confirmation",
+        body=data.get("body") if isinstance(data.get("body"), dict) else None,
     )
 
 
@@ -373,6 +398,13 @@ def parse_chat_response(result: Dict[str, Any]) -> ChatResponse:
 
     if state == "input-required" and text and not confirmation and "请在下方输入补充信息" not in text:
         text = f"{text}\n\n请在下方输入补充信息后继续对话。"
+
+    if (
+        confirmation
+        and confirmation.confirm_type == "plan_confirm"
+        and text
+    ):
+        text = text.split("\n\n", 1)[0]
 
     return ChatResponse(
         task_id=task_id,

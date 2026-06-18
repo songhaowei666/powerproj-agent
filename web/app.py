@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import streamlit as st
 
 from web.client import MainAgentClient, StreamEvent, parse_chat_response, ConfirmationUI
+from main_agent.task_manager import format_plan_approve_reply
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 
@@ -136,7 +137,7 @@ def _render_sidebar() -> str:
         st.markdown(
             "1. 先启动主控 Agent（端口 8000）及业务 Agent\n"
             "2. 输入自然语言问题，例如统计、规划、投资相关需求\n"
-            "3. 待确认时可点「是/否」，或在输入框输入新问题开启新任务\n"
+            "3. 计划确认时可勾选子任务并点「开始执行」，业务确认可点「是/否」\n"
             "4. 调用轨迹与总结会在处理过程中实时更新"
         )
 
@@ -239,6 +240,89 @@ def _render_confirmation_buttons(confirmation: ConfirmationUI, task_id: str) -> 
                 st.rerun()
 
 
+def _render_plan_confirm_ui(confirmation: ConfirmationUI, task_id: str) -> None:
+    """渲染计划确认勾选框与操作按钮。"""
+    body = confirmation.body or {}
+    tasks = body.get("tasks") or []
+    revision = int(body.get("revision") or 1)
+    task_items = [
+        task for task in tasks if isinstance(task, dict) and task.get("id")
+    ]
+
+    if confirmation.title:
+        st.markdown(f"**{confirmation.title}**")
+
+    checkbox_items: list[tuple[str, str]] = []
+    for index, task in enumerate(task_items):
+        task_id_value = str(task["id"])
+        checkbox_key = f"plan_task_{task_id}_{revision}_{task_id_value}_{index}"
+        agent_name = str(task.get("required_agent", ""))
+        task_name = str(task.get("name", ""))
+        label = f"[{agent_name}] {task_name}" if agent_name else task_name
+        st.checkbox(label, value=True, key=checkbox_key)
+        checkbox_items.append((checkbox_key, task_id_value))
+
+    all_task_ids = [item[1] for item in checkbox_items]
+    approve_option = next(
+        (option for option in confirmation.options if option.get("id") == "approve"),
+        None,
+    )
+    other_options = [
+        option for option in confirmation.options if option.get("id") != "approve"
+    ]
+    button_count = (1 if approve_option else 0) + len(other_options)
+    cols = st.columns(max(button_count, 1))
+    col_index = 0
+
+    if approve_option:
+        selected_ids = [
+            task_id_value
+            for checkbox_key, task_id_value in checkbox_items
+            if st.session_state.get(checkbox_key, True)
+        ]
+        with cols[col_index]:
+            if st.button(
+                approve_option["label"],
+                key=f"plan_approve_{task_id}_{revision}",
+                use_container_width=True,
+                disabled=not selected_ids,
+            ):
+                st.session_state.confirmation_reply = format_plan_approve_reply(
+                    selected_ids,
+                    all_task_ids,
+                )
+                st.session_state.pending_confirmation = None
+                st.rerun()
+        col_index += 1
+
+    for option in other_options:
+        with cols[col_index]:
+            if st.button(
+                option["label"],
+                key=f"plan_action_{task_id}_{revision}_{option['id']}",
+                use_container_width=True,
+            ):
+                st.session_state.confirmation_reply = option["replyText"]
+                st.session_state.pending_confirmation = None
+                st.rerun()
+        col_index += 1
+
+
+def _render_confirmation_ui(confirmation: ConfirmationUI, task_id: str) -> None:
+    """根据确认类型渲染按钮或计划勾选框。"""
+    if confirmation.confirm_type == "plan_confirm":
+        _render_plan_confirm_ui(confirmation, task_id)
+        return
+    _render_confirmation_buttons(confirmation, task_id)
+
+
+def _format_assistant_message_content(content: str, confirmation: ConfirmationUI | None) -> str:
+    """计划确认时仅展示引导语，子任务清单由勾选框承担。"""
+    if confirmation and confirmation.confirm_type == "plan_confirm" and content:
+        return content.split("\n\n", 1)[0]
+    return content
+
+
 def _process_assistant_response(
     base_url: str,
     trace_slot,
@@ -279,9 +363,11 @@ def _process_assistant_response(
         else:
             with trace_slot.container():
                 _render_invocation_traces(turn_traces)
-            text_slot.markdown(chat_resp.text)
+            text_slot.markdown(
+                _format_assistant_message_content(chat_resp.text, chat_resp.confirmation)
+            )
             if chat_resp.confirmation and chat_resp.task_id:
-                _render_confirmation_buttons(chat_resp.confirmation, chat_resp.task_id)
+                _render_confirmation_ui(chat_resp.confirmation, chat_resp.task_id)
 
         st.session_state.messages.append(
             {
@@ -344,14 +430,18 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         if message["role"] == "assistant" and message.get("invocation_traces"):
             _render_invocation_traces(message["invocation_traces"])
-        st.markdown(message["content"])
+        display_content = _format_assistant_message_content(
+            message["content"],
+            message.get("confirmation"),
+        )
+        st.markdown(display_content)
         if (
             message["role"] == "assistant"
             and st.session_state.awaiting_input
             and message.get("confirmation")
             and message.get("task_id") == st.session_state.task_id
         ):
-            _render_confirmation_buttons(message["confirmation"], message["task_id"])
+            _render_confirmation_ui(message["confirmation"], message["task_id"])
 
 if st.session_state.confirmation_reply:
     reply_text = st.session_state.confirmation_reply
