@@ -6,7 +6,7 @@ patterns=(
     "investment_agent/main.py"
     "statistics_agent/main.py"
     "main_agent/server.py"
-    "streamlit run web/app.py"
+    "uvicorn web.server:app"
 )
 
 for pattern in "${patterns[@]}"; do

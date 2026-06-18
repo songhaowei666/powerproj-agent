@@ -7,6 +7,7 @@ pydantic
 pydantic-settings
 starlette
 uvicorn
+fastapi
 httpx
 
 # 测试依赖

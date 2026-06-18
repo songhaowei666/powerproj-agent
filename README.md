@@ -47,7 +47,7 @@ flowchart TB
 | 投资 Agent | `investment_agent/` | 8002 | 电力项目投资测算与造价分析 |
 | 统计 Agent | `statistics_agent/` | 8003 | 电力项目规模统计与指标对比 |
 | 意图识别 | `intent_agent/` | — | 内嵌于主控 Agent，非独立服务 |
-| Web 聊天页 | `web/` | 8501 | Streamlit 界面，通过主控 Agent 调度业务能力 |
+| Web 聊天页 | `web/` | 8501 | React + FastAPI BFF，通过主控 Agent 调度业务能力 |
 | A2A 验证器 | `a2a_validator/` | — | Streamlit 诊断工具，验证任意 A2A 端点 |
 
 ### 能力路由
@@ -73,7 +73,7 @@ flowchart TB
 | 配置管理 | `pydantic-settings` + `.env` |
 | 数据库 | SQLite（Planning Agent） |
 | HTTP 客户端 | `httpx` |
-| 验证工具 / 聊天 UI | `streamlit` |
+| 验证工具 / 聊天 UI | `streamlit`（A2A 验证器）、React + FastAPI（Web 聊天页） |
 | 测试 | `pytest`, `pytest-asyncio` |
 
 ## 目录结构
@@ -90,7 +90,7 @@ powerproj-agent/
 ├── investment_agent/        # 投资 Agent
 ├── statistics_agent/        # 统计 Agent
 ├── providers/               # LLM 统一实例化
-├── web/                     # Web 聊天页（Streamlit）
+├── web/                     # Web 聊天页（React 前端 + FastAPI BFF）
 ├── scripts/                 # 一键启动 / 停止脚本
 ├── examples/                # A2A 调用示例与演示脚本
 ├── spec/                    # 各 Agent 技术规格文档
@@ -176,8 +176,11 @@ python statistics_agent/main.py
 # 终端 4 - 主控 Agent（用户入口）
 python main_agent/server.py
 
-# 终端 5 - Web 聊天页（可选）
-streamlit run web/app.py
+# 终端 5 - Web BFF（可选）
+uvicorn web.server:app --reload --port 8501
+
+# 终端 6 - Web 前端开发（可选，需先启动 BFF）
+cd web/frontend && npm install && npm run dev
 ```
 
 启动后可访问各 Agent 的 Agent Card（a2a-sdk 默认路径）：
@@ -193,7 +196,7 @@ curl http://localhost:8003/.well-known/agent-card.json   # 统计
 
 #### Web 聊天页
 
-浏览器打开 http://localhost:8501 ，在界面中直接输入自然语言即可。页面会自动处理 `input-required` 多轮补全。
+浏览器开发模式打开 http://localhost:5173 （Vite 代理 `/api` 到 BFF）；生产构建后访问 http://localhost:8501 。页面会自动处理 `input-required` 多轮补全、计划确认与流式调用轨迹。
 
 #### curl / A2A Client
 

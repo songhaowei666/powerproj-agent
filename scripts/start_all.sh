@@ -36,7 +36,7 @@ start_service "main" "python -u main_agent/server.py"
 sleep 3
 
 echo "=== 启动 Web 聊天页 ==="
-start_service "web" "streamlit run web/app.py --server.headless true --server.port 8501"
+start_service "web" "uvicorn web.server:app --host 0.0.0.0 --port 8501"
 sleep 3
 
 echo ""
@@ -47,5 +47,5 @@ echo "统计 Agent:   http://localhost:8003"
 echo "主控 Agent:   http://localhost:8000"
 echo "Web 聊天页:   http://localhost:8501"
 echo ""
-echo "查看进程: pgrep -fl 'planning_agent/main|investment_agent/main|statistics_agent/main|main_agent/server|streamlit run web'"
+echo "查看进程: pgrep -fl 'planning_agent/main|investment_agent/main|statistics_agent/main|main_agent/server|uvicorn web.server'"
 echo "停止服务: bash scripts/stop_all.sh"
