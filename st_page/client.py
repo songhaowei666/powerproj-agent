@@ -49,6 +49,7 @@ class ChatResponse:
     """解析后的聊天响应。"""
 
     task_id: str
+    context_id: str
     state: str
     text: str
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
@@ -74,6 +75,7 @@ class MainAgentClient:
         self,
         message_text: str,
         task_id: Optional[str] = None,
+        context_id: Optional[str] = None,
         on_event: Optional[Callable[[StreamEvent], None]] = None,
     ) -> Dict[str, Any]:
         """向主控 Agent 发送单条消息（流式接收）。
@@ -81,13 +83,20 @@ class MainAgentClient:
         Args:
             message_text: 用户消息内容
             task_id: 已有任务 ID，用于继续对话或恢复中断
+            context_id: 会话 context ID，续传 task 时必须与首轮一致
             on_event: 流式事件回调，用于 UI 实时刷新
 
         Returns:
-            包含 status、detail、data、task_id 的结果字典
+            包含 status、detail、data、task_id、context_id 的结果字典
         """
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            return await self._send_streaming_message(client, message_text, task_id, on_event)
+            return await self._send_streaming_message(
+                client,
+                message_text,
+                task_id,
+                context_id,
+                on_event,
+            )
 
     async def check_connectivity(self) -> bool:
         """检查主控 Agent 是否可访问。"""
@@ -103,6 +112,7 @@ class MainAgentClient:
         client: httpx.AsyncClient,
         message_text: str,
         task_id: Optional[str] = None,
+        context_id: Optional[str] = None,
         on_event: Optional[Callable[[StreamEvent], None]] = None,
     ) -> Dict[str, Any]:
         """底层：通过 A2A SDK 流式发送 SendMessage 请求。"""
@@ -127,6 +137,8 @@ class MainAgentClient:
         )
         if task_id:
             message.task_id = task_id
+        if context_id:
+            message.context_id = context_id
 
         request = SendMessageRequest(
             message=message,
@@ -138,6 +150,7 @@ class MainAgentClient:
         artifacts: List[Dict[str, Any]] = []
         task_data: Dict[str, Any] = {}
         returned_task_id = task_id or ""
+        returned_context_id = context_id or ""
         task_state = ""
 
         try:
@@ -145,6 +158,8 @@ class MainAgentClient:
                 if response.HasField("status_update"):
                     event = response.status_update
                     returned_task_id = event.task_id or returned_task_id
+                    if event.context_id:
+                        returned_context_id = event.context_id
                     status = event.status
                     task_state = _normalize_task_state(status.state)
 
@@ -196,6 +211,7 @@ class MainAgentClient:
 
                     task_data = {
                         "id": returned_task_id,
+                        "contextId": returned_context_id,
                         "status": json_format.MessageToDict(status),
                         "artifacts": artifacts,
                     }
@@ -203,6 +219,8 @@ class MainAgentClient:
                 elif response.HasField("artifact_update"):
                     event = response.artifact_update
                     returned_task_id = event.task_id or returned_task_id
+                    if event.context_id:
+                        returned_context_id = event.context_id
                     artifact_dict = json_format.MessageToDict(event.artifact)
                     artifacts.append(artifact_dict)
                     stream_event = StreamEvent(
@@ -214,6 +232,7 @@ class MainAgentClient:
                         on_event(stream_event)
                     task_data = {
                         "id": returned_task_id,
+                        "contextId": returned_context_id,
                         "status": task_data.get("status", {}),
                         "artifacts": artifacts,
                     }
@@ -224,6 +243,7 @@ class MainAgentClient:
                 "detail": f"流式请求失败：{type(exc).__name__}: {exc}",
                 "data": task_data,
                 "task_id": returned_task_id,
+                "context_id": returned_context_id,
                 "invocation_traces": invocation_traces,
                 "summary_parts": summary_parts,
             }
@@ -231,6 +251,7 @@ class MainAgentClient:
         if not task_data:
             task_data = {
                 "id": returned_task_id,
+                "contextId": returned_context_id,
                 "status": {"state": task_state},
                 "artifacts": artifacts,
             }
@@ -240,6 +261,7 @@ class MainAgentClient:
             "detail": f"Task 状态: {task_state or 'unknown'}",
             "data": task_data,
             "task_id": returned_task_id,
+            "context_id": returned_context_id,
             "invocation_traces": invocation_traces,
             "summary_parts": summary_parts,
         }
@@ -313,6 +335,27 @@ def _normalize_confirmation_options(
     return normalized_options
 
 
+def _extract_context_id(result: Dict[str, Any], data: Dict[str, Any]) -> str:
+    """从流式结果或 Task 字典中提取 context_id。"""
+    context_id = str(result.get("context_id") or "").strip()
+    if context_id:
+        return context_id
+
+    context_id = str(data.get("contextId") or data.get("context_id") or "").strip()
+    if context_id:
+        return context_id
+
+    status_message = data.get("status", {}).get("message", {})
+    if isinstance(status_message, dict):
+        context_id = str(
+            status_message.get("contextId") or status_message.get("context_id") or ""
+        ).strip()
+        if context_id:
+            return context_id
+
+    return ""
+
+
 def _build_confirmation_ui(
     parts: List[Dict[str, Any]],
 ) -> Optional[ConfirmationUI]:
@@ -348,17 +391,20 @@ def _build_confirmation_ui(
 def parse_chat_response(result: Dict[str, Any]) -> ChatResponse:
     """将客户端原始响应解析为聊天展示结构。"""
     if result.get("status") != "passed":
+        data = result.get("data", {})
         return ChatResponse(
             task_id=result.get("task_id", ""),
+            context_id=_extract_context_id(result, data),
             state="failed",
             text=result.get("detail", "请求失败"),
             invocation_traces=result.get("invocation_traces", []),
-            raw=result.get("data", {}),
+            raw=data,
             is_error=True,
         )
 
     data = result.get("data", {})
     task_id = result.get("task_id", data.get("id", ""))
+    context_id = _extract_context_id(result, data)
     state = _normalize_task_state(data.get("status", {}).get("state", ""))
 
     status_message = data.get("status", {}).get("message", {})
@@ -408,6 +454,7 @@ def parse_chat_response(result: Dict[str, Any]) -> ChatResponse:
 
     return ChatResponse(
         task_id=task_id,
+        context_id=context_id,
         state=state,
         text=text or "（无响应内容）",
         artifacts=artifacts,

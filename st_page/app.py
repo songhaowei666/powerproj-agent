@@ -38,6 +38,8 @@ def _init_session_state() -> None:
         st.session_state.messages = []
     if "task_id" not in st.session_state:
         st.session_state.task_id = None
+    if "context_id" not in st.session_state:
+        st.session_state.context_id = None
     if "awaiting_input" not in st.session_state:
         st.session_state.awaiting_input = False
     if "pending_confirmation" not in st.session_state:
@@ -54,6 +56,7 @@ def _reset_conversation() -> None:
     """清空当前对话。"""
     st.session_state.messages = []
     st.session_state.task_id = None
+    st.session_state.context_id = None
     st.session_state.awaiting_input = False
     st.session_state.pending_confirmation = None
     st.session_state.confirmation_reply = None
@@ -182,11 +185,17 @@ async def _send_streaming_to_main_agent(
     base_url: str,
     message: str,
     task_id: str | None,
+    context_id: str | None,
     on_event,
 ):
     """流式发送消息到主控 Agent。"""
     client = MainAgentClient(base_url=base_url)
-    return await client.send_message(message, task_id, on_event=on_event)
+    return await client.send_message(
+        message,
+        task_id,
+        context_id=context_id,
+        on_event=on_event,
+    )
 
 
 def _is_awaiting_confirmation() -> bool:
@@ -215,11 +224,19 @@ def _resolve_chat_send_task_id() -> str | None:
     """
     if _is_awaiting_confirmation():
         st.session_state.task_id = None
+        st.session_state.context_id = None
         st.session_state.awaiting_input = False
         st.session_state.pending_confirmation = None
         return None
     if st.session_state.awaiting_input:
         return st.session_state.task_id
+    return None
+
+
+def _resolve_chat_send_context_id() -> str | None:
+    """解析续传时应携带的 context_id。"""
+    if st.session_state.awaiting_input and st.session_state.task_id:
+        return st.session_state.context_id
     return None
 
 
@@ -330,6 +347,7 @@ def _process_assistant_response(
     *,
     user_prompt: str,
     send_task_id: str | None,
+    send_context_id: str | None,
 ) -> None:
     """发送消息并渲染助手回复（含确认按钮）。"""
     if send_task_id is None:
@@ -342,6 +360,7 @@ def _process_assistant_response(
             base_url,
             user_prompt,
             send_task_id,
+            send_context_id,
             trace_slot,
             text_slot,
             turn_traces,
@@ -352,9 +371,11 @@ def _process_assistant_response(
         st.session_state.awaiting_input = chat_resp.state == "input-required"
         if st.session_state.awaiting_input:
             st.session_state.task_id = chat_resp.task_id or None
+            st.session_state.context_id = chat_resp.context_id or None
             st.session_state.pending_confirmation = chat_resp.confirmation
         else:
             st.session_state.task_id = None
+            st.session_state.context_id = None
             st.session_state.pending_confirmation = None
 
         if chat_resp.is_error:
@@ -390,6 +411,7 @@ def _send_to_main_agent(
     base_url: str,
     message: str,
     task_id: str | None,
+    context_id: str | None,
     trace_slot,
     text_slot,
     turn_traces: list[dict],
@@ -410,7 +432,13 @@ def _send_to_main_agent(
                 st.markdown("".join(summary_parts))
 
     return asyncio.run(
-        _send_streaming_to_main_agent(base_url, message, task_id, _on_event)
+        _send_streaming_to_main_agent(
+            base_url,
+            message,
+            task_id,
+            context_id,
+            _on_event,
+        )
     )
 
 
@@ -467,6 +495,7 @@ if st.session_state.confirmation_reply:
                 text_slot,
                 user_prompt=reply_text,
                 send_task_id=st.session_state.task_id,
+                send_context_id=st.session_state.context_id,
             )
 
 prompt = st.chat_input(
@@ -490,10 +519,12 @@ if prompt:
             text_slot.markdown("_正在处理，请稍候..._")
 
             send_task_id = _resolve_chat_send_task_id()
+            send_context_id = _resolve_chat_send_context_id()
             _process_assistant_response(
                 base_url,
                 trace_slot,
                 text_slot,
                 user_prompt=prompt,
                 send_task_id=send_task_id,
+                send_context_id=send_context_id,
             )
