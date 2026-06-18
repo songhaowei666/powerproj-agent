@@ -13,6 +13,10 @@
 
 运行形态：与其他业务 Agent 一致，为 FastAPI A2A Server，暴露 JSON-RPC over HTTP 端点。
 
+> **计划确认模式（待实现）**：意图识别产出计划后，先经用户确认再执行业务 Agent，并支持执行中取消与结构化进度展示。详见 [task_manager_spec.md](./task_manager_spec.md)。
+
+> **Agent Memory（待实现）**：跨轮次会话记忆，在意图识别前注入推断上下文。详见 [agent_memory_spec.md](./agent_memory_spec.md)。
+
 ## 2. 术语
 
 | 术语 | 说明 |

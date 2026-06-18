@@ -10,6 +10,8 @@
 - 在提示词中注入各业务 Agent 列表（AgentCard.name / description，skills 仅作业务能力说明）
 - 输出从"业务类型任务列表"升级为"带执行顺序的子任务规划"
 
+> **Agent Memory（待实现）**：可选输入 `inferred_context`，用于指代消解与跨轮次任务规划。详见 [agent_memory_spec.md](./agent_memory_spec.md)。
+
 ## 2. 术语
 
 | 术语 | 说明 |

@@ -4,6 +4,8 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
+from langgraph.types import Command
+
 from main_agent.agent_executor import MainAgentExecutor
 from main_agent.models import MainState, TaskOutput
 from main_agent.graph import (
@@ -14,8 +16,31 @@ from main_agent.graph import (
 )
 from main_agent.executor import build_task_parts, call_business_agent, extract_artifact_text
 from main_agent.agent_network import AgentNetwork
-from main_agent.streaming import format_trace_step_message, parse_trace_step_message
+from main_agent.streaming import (
+    format_trace_step_message,
+    parse_trace_step_message,
+    format_task_progress_message,
+    parse_task_progress_message,
+)
 from intent_agent.models import IntentResult, SubTask
+
+
+async def _invoke_with_plan_approval(
+    graph,
+    input_value,
+    config: dict,
+    *,
+    approve_text: str = "确认执行",
+):
+    """执行 graph，并在 plan_confirm interrupt 时自动确认计划。"""
+    result = await graph.ainvoke(input_value, config)
+    while isinstance(result, dict) and "__interrupt__" in result:
+        interrupt_value = result["__interrupt__"][0].value
+        if interrupt_value.get("type") == "plan_confirm":
+            result = await graph.ainvoke(Command(resume=approve_text), config)
+            continue
+        break
+    return result
 
 
 @pytest.fixture
@@ -102,6 +127,17 @@ class TestStreamingProtocol:
         message = format_trace_step_message(trace)
         parsed = parse_trace_step_message(message)
         assert parsed == trace
+
+    def test_task_progress_roundtrip(self):
+        progress = {
+            "revision": 1,
+            "plan_status": "executing",
+            "completed_count": 1,
+            "total_count": 2,
+        }
+        message = format_task_progress_message(progress)
+        parsed = parse_task_progress_message(message)
+        assert parsed == progress
 
 
 class TestClarificationPrompt:
@@ -225,6 +261,183 @@ class TestBuildPhases:
         assert graph is not None
 
 
+class TestPlanConfirm:
+    """测试计划确认模式。"""
+
+    def _build_mock_card(self, agent_name: str, url: str = "http://localhost:8001"):
+        iface = MagicMock()
+        iface.protocol_binding = "JSONRPC"
+        iface.url = url
+        card = MagicMock()
+        card.name = agent_name
+        card.skills = []
+        card.supported_interfaces = [iface]
+        return card
+
+    def _register_agents(self, agent_network: AgentNetwork, agent_names: list[str]) -> None:
+        agent_network._cards = [
+            self._build_mock_card(agent_name) for agent_name in agent_names
+        ]
+
+    @pytest.mark.asyncio
+    async def test_plan_confirm_interrupt(self, mock_llm, agent_network):
+        """计划就绪后应触发 plan_confirm interrupt。"""
+        self._register_agents(agent_network, ["statistics-agent"])
+        graph = build_main_graph(mock_llm, agent_network)
+        intent_result = IntentResult(
+            task_goal="统计收益",
+            subtasks=[
+                SubTask(
+                    id="t1",
+                    name="统计分析",
+                    description="统计分析",
+                    dependencies=[],
+                    expected_output="统计结果",
+                    required_agent="statistics-agent",
+                    confidence=0.95,
+                )
+            ],
+            execution_order=["t1"],
+            reasoning="测试",
+        )
+
+        with patch(
+            "intent_agent.agent.IntentAgent.recognize",
+            new_callable=AsyncMock,
+            return_value=intent_result,
+        ):
+            with patch(
+                "main_agent.graph.call_business_agent",
+                new_callable=AsyncMock,
+            ) as mock_call:
+                result = await graph.ainvoke(
+                    MainState(query="帮我统计收益"),
+                    {"configurable": {"thread_id": "test-plan-confirm"}},
+                )
+
+        assert "__interrupt__" in result
+        interrupt_info = result["__interrupt__"][0].value
+        assert interrupt_info["type"] == "plan_confirm"
+        assert interrupt_info["plan"]["goal"] == "统计收益"
+        assert len(interrupt_info["plan"]["tasks"]) == 1
+        mock_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plan_cancel(self, mock_llm, agent_network):
+        """用户取消计划时不应执行业务 Agent。"""
+        self._register_agents(agent_network, ["statistics-agent"])
+        graph = build_main_graph(mock_llm, agent_network)
+        intent_result = IntentResult(
+            task_goal="统计收益",
+            subtasks=[
+                SubTask(
+                    id="t1",
+                    name="统计分析",
+                    description="统计分析",
+                    dependencies=[],
+                    expected_output="统计结果",
+                    required_agent="statistics-agent",
+                    confidence=0.95,
+                )
+            ],
+            execution_order=["t1"],
+            reasoning="测试",
+        )
+
+        with patch(
+            "intent_agent.agent.IntentAgent.recognize",
+            new_callable=AsyncMock,
+            return_value=intent_result,
+        ):
+            with patch(
+                "main_agent.graph.call_business_agent",
+                new_callable=AsyncMock,
+            ) as mock_call:
+                result = await _invoke_with_plan_approval(
+                    graph,
+                    MainState(query="帮我统计收益"),
+                    {"configurable": {"thread_id": "test-plan-cancel"}},
+                    approve_text="取消",
+                )
+
+        assert result["status"] == "cancelled"
+        assert result["task_plan"]["plan_status"] == "cancelled"
+        mock_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plan_modify_increases_revision(self, mock_llm, agent_network):
+        """修改计划后应重新识别并递增 revision。"""
+        self._register_agents(agent_network, ["statistics-agent"])
+        graph = build_main_graph(mock_llm, agent_network)
+        first_intent = IntentResult(
+            task_goal="统计收益并下载文件",
+            subtasks=[
+                SubTask(
+                    id="t1",
+                    name="统计分析",
+                    description="统计分析",
+                    dependencies=[],
+                    expected_output="统计结果",
+                    required_agent="statistics-agent",
+                    confidence=0.95,
+                ),
+                SubTask(
+                    id="t2",
+                    name="下载文件",
+                    description="下载文件",
+                    dependencies=["t1"],
+                    expected_output="文件",
+                    required_agent="statistics-agent",
+                    confidence=0.95,
+                ),
+            ],
+            execution_order=["t1", "t2"],
+            reasoning="测试",
+        )
+        second_intent = IntentResult(
+            task_goal="只要统计收益",
+            subtasks=[
+                SubTask(
+                    id="t1",
+                    name="统计分析",
+                    description="统计分析",
+                    dependencies=[],
+                    expected_output="统计结果",
+                    required_agent="statistics-agent",
+                    confidence=0.95,
+                )
+            ],
+            execution_order=["t1"],
+            reasoning="修改后",
+        )
+
+        recognize_mock = AsyncMock(side_effect=[first_intent, second_intent])
+        with patch("intent_agent.agent.IntentAgent.recognize", recognize_mock):
+            with patch(
+                "main_agent.graph.call_business_agent",
+                new_callable=AsyncMock,
+                return_value={"status": "success", "artifacts": [{"type": "text", "text": "结果"}]},
+            ) as mock_call:
+                first = await graph.ainvoke(
+                    MainState(query="帮我统计收益并下载文件"),
+                    {"configurable": {"thread_id": "test-plan-modify"}},
+                )
+                assert first["__interrupt__"][0].value["type"] == "plan_confirm"
+                second = await graph.ainvoke(
+                    Command(resume="修改计划：只要统计，不要下载"),
+                    {"configurable": {"thread_id": "test-plan-modify"}},
+                )
+                assert "__interrupt__" in second
+                assert second["__interrupt__"][0].value["plan"]["revision"] == 2
+                assert len(second["__interrupt__"][0].value["plan"]["tasks"]) == 1
+                final = await graph.ainvoke(
+                    Command(resume="确认执行"),
+                    {"configurable": {"thread_id": "test-plan-modify"}},
+                )
+                assert final["status"] == "completed"
+                mock_call.assert_called_once()
+
+
 class TestMainAgentFlow:
     """测试主控 Agent 端到端流程。"""
 
@@ -309,7 +522,8 @@ class TestMainAgentFlow:
                     },
                 },
             ):
-                result = await graph.ainvoke(
+                result = await _invoke_with_plan_approval(
+                    graph,
                     MainState(query="帮我统计收益", session_id="test-session"),
                     {"configurable": {"thread_id": "test-1"}},
                 )
@@ -465,7 +679,8 @@ class TestMainAgentFlow:
             ):
                 from langgraph.types import Command
 
-                result2 = await graph.ainvoke(
+                result2 = await _invoke_with_plan_approval(
+                    graph,
                     Command(resume="我想统计今年的投资收益"),
                     {"configurable": {"thread_id": "test-2"}},
                 )
@@ -541,7 +756,8 @@ class TestMainAgentFlow:
             return_value=intent_result,
         ):
             with patch("main_agent.graph.call_business_agent", side_effect=mock_call):
-                result = await graph.ainvoke(
+                result = await _invoke_with_plan_approval(
+                    graph,
                     MainState(query="统计和投资"),
                     {"configurable": {"thread_id": "test-3"}},
                 )
@@ -603,7 +819,8 @@ class TestMainAgentFlow:
             return_value=intent_result,
         ):
             with patch("main_agent.graph.call_business_agent", side_effect=mock_call):
-                result = await graph.ainvoke(
+                result = await _invoke_with_plan_approval(
+                    graph,
                     MainState(query="统计和规划"),
                     {"configurable": {"thread_id": "test-4"}},
                 )

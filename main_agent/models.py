@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 
 from intent_agent.models import IntentResult
+from main_agent.task_models import ManagedTaskPlan
 
 
 class InvocationTraceEntry(BaseModel):
@@ -53,11 +54,22 @@ class MainState(BaseModel):
         default_factory=list, description="最终汇总的artifacts"
     )
     status: str = Field(
-        default="pending", description="整体状态：pending / executing / completed / failed"
+        default="pending",
+        description="整体状态：pending / executing / completed / failed / cancelled",
     )
     summary: Optional[str] = Field(
         default=None, description="LLM 生成的自然语言总结"
     )
     invocation_traces: List[Dict[str, Any]] = Field(
         default_factory=list, description="意图识别与业务 Agent 的调用轨迹"
+    )
+    task_plan: Optional[ManagedTaskPlan] = Field(
+        default=None, description="Task Manager 托管的计划与进度"
+    )
+    cancel_requested: bool = Field(default=False, description="协作式取消标志")
+    plan_revision_base: Optional[int] = Field(
+        default=None, description="用户修改计划时的版本基数"
+    )
+    replan_from_modify: bool = Field(
+        default=False, description="是否因修改计划回到意图识别"
     )

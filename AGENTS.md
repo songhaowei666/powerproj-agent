@@ -19,6 +19,7 @@
 | `planning_agent/` | **规划 Agent**，负责电网规划业务的实现 |
 | `providers/` | LLM 提供商统一封装，集中实例化各模型客户端 |
 | `rag/` | RAG（检索增强生成）基础设施，提供向量检索与知识库支持 |
+| `memory/` | Agent Memory，跨轮次会话记忆与上下文推断（见 [spec/agent_memory_spec.md](./spec/agent_memory_spec.md)） |
 | `spec/` | 各 Agent 的详细技术规格文档（Markdown） |
 | `statistics_agent/` | **统计 Agent**，负责电网统计业务的实现 |
 

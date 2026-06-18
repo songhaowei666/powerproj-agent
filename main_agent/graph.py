@@ -15,6 +15,12 @@ from intent_agent.agent import IntentAgent
 from intent_agent.models import IntentResult, SubTask
 from main_agent.agent_network import AgentNetwork
 from main_agent.models import MainState, TaskOutput, InvocationTraceEntry
+from main_agent.task_manager import (
+    TaskManager,
+    parse_plan_confirm_action,
+    extract_plan_modify_text,
+    PLAN_CONFIRM_QUESTION,
+)
 from main_agent.executor import (
     call_business_agent,
     build_task_parts,
@@ -99,6 +105,7 @@ def _serialize_agent_cards_summary(agent_cards: List[Any]) -> List[Dict[str, Any
 
 TracePublisher = Callable[[Dict[str, Any]], Awaitable[None]]
 SummaryChunkPublisher = Callable[[str], Awaitable[None]]
+ProgressPublisher = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
 def _get_trace_publisher(config: Optional[RunnableConfig]) -> Optional[TracePublisher]:
@@ -119,6 +126,31 @@ def _get_summary_publisher(
     configurable = config.get("configurable") or {}
     publisher = configurable.get("publish_summary_chunk")
     return publisher if callable(publisher) else None
+
+
+def _get_progress_publisher(
+    config: Optional[RunnableConfig],
+) -> Optional[ProgressPublisher]:
+    """从 LangGraph config 中获取任务进度流式推送回调。"""
+    if not config:
+        return None
+    configurable = config.get("configurable") or {}
+    publisher = configurable.get("publish_progress")
+    return publisher if callable(publisher) else None
+
+
+async def _publish_task_progress(
+    state: MainState,
+    config: Optional[RunnableConfig] = None,
+) -> None:
+    """推送当前任务计划进度快照。"""
+    if state.task_plan is None:
+        return
+    publisher = _get_progress_publisher(config)
+    if publisher is None:
+        return
+    payload = TaskManager.build_progress_payload(state.task_plan)
+    await publisher(payload)
 
 
 async def _record_trace(
@@ -373,13 +405,113 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         return state
 
     def route_after_recognize(state: MainState) -> str:
-        """意图识别后路由：非业务 query 直接回复，否则进入任务编排。"""
+        """意图识别后路由：非业务 query 直接回复，否则进入计划准备。"""
         if state.intent_result and not state.intent_result.is_business_query:
             return "direct_reply"
-        return "build_phases"
+        return "prepare_plan"
+
+    async def prepare_plan(
+        state: MainState, config: RunnableConfig
+    ) -> MainState:
+        """将 IntentResult 转为 draft 态 ManagedTaskPlan。"""
+        if state.intent_result is None:
+            return state
+
+        revision = 1
+        if state.plan_revision_base is not None:
+            revision = state.plan_revision_base + 1
+            state.plan_revision_base = None
+
+        state.task_plan = TaskManager.create_plan_from_intent(
+            state.intent_result,
+            revision=revision,
+        )
+        state.phases = []
+        state.current_phase_idx = 0
+        state.task_outputs = {}
+        state.failed_task_id = None
+        state.error_message = None
+        state.status = "pending"
+        state.replan_from_modify = False
+        await _publish_task_progress(state, config)
+        return state
+
+    async def await_plan_approval(
+        state: MainState, config: RunnableConfig
+    ) -> MainState:
+        """展示计划并等待用户确认、修改或取消。"""
+        if state.task_plan is None:
+            return state
+
+        plan_summary = state.task_plan.to_plan_summary_dict()
+        user_reply = interrupt(
+            {
+                "type": "plan_confirm",
+                "question": PLAN_CONFIRM_QUESTION,
+                "plan": plan_summary,
+            }
+        )
+        action = parse_plan_confirm_action(str(user_reply))
+
+        if action == "cancel":
+            state.task_plan = TaskManager.cancel_plan(state.task_plan, "用户取消")
+            state.status = "cancelled"
+            await _publish_task_progress(state, config)
+            return state
+
+        if action == "modify":
+            modify_text = extract_plan_modify_text(str(user_reply))
+            if modify_text:
+                state.query += f"\n修改计划：{modify_text}"
+            else:
+                state.query += f"\n{str(user_reply).strip()}"
+            state.plan_revision_base = state.task_plan.revision
+            state.task_plan = None
+            state.replan_from_modify = True
+            return state
+
+        if action == "approve":
+            state.task_plan = TaskManager.approve_plan(state.task_plan)
+            await _publish_task_progress(state, config)
+            return state
+
+        # 未能识别操作，视为修改说明
+        state.query += f"\n修改计划：{str(user_reply).strip()}"
+        state.plan_revision_base = state.task_plan.revision
+        state.task_plan = None
+        state.replan_from_modify = True
+        return state
+
+    async def handle_cancelled(
+        state: MainState, config: RunnableConfig
+    ) -> MainState:
+        """组装取消结果。"""
+        if state.task_plan is not None and state.task_plan.plan_status != "cancelled":
+            state.task_plan = TaskManager.cancel_plan(state.task_plan, "用户取消")
+            await _publish_task_progress(state, config)
+
+        cancel_message = TaskManager.build_cancel_message(state.task_plan)
+        state.summary = cancel_message
+        state.final_artifacts = [{"type": "text", "text": cancel_message}]
+        state.status = "cancelled"
+        return state
+
+    def route_after_plan_approval(state: MainState) -> str:
+        """计划确认后的路由。"""
+        if state.status == "cancelled":
+            return "handle_cancelled"
+        if state.replan_from_modify:
+            return "recognize_and_check"
+        if state.task_plan and state.task_plan.plan_status == "approved":
+            return "build_phases"
+        return "await_plan_approval"
 
     def build_phases(state: MainState) -> MainState:
         """根据任务依赖关系拓扑排序并分层。"""
+        if state.task_plan is None or state.task_plan.plan_status != "approved":
+            return state
+
+        state.task_plan = TaskManager.start_execution(state.task_plan)
         subtasks = state.intent_result.subtasks
         task_ids = {t.id for t in subtasks}
 
@@ -522,6 +654,15 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         if state.current_phase_idx >= len(state.phases):
             return state
 
+        if state.cancel_requested and state.task_plan is not None:
+            state.task_plan = TaskManager.mark_remaining_skipped(state.task_plan)
+            state.task_plan = TaskManager.cancel_plan(
+                state.task_plan, "用户取消执行"
+            )
+            state.status = "cancelled"
+            await _publish_task_progress(state, config)
+            return state
+
         agent_cards = agent_network.get_cards()
         phase_task_ids = state.phases[state.current_phase_idx]
         subtask_map: Dict[str, SubTask] = {
@@ -531,6 +672,13 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         session_id = state.session_id or "default"
         phase_results: Dict[str, Any] = {}
         pending_tids = list(phase_task_ids)
+
+        for tid in pending_tids:
+            if state.task_plan is not None:
+                state.task_plan = TaskManager.mark_task_in_progress(
+                    state.task_plan, tid
+                )
+        await _publish_task_progress(state, config)
 
         while pending_tids:
             pending_tasks: Dict[asyncio.Task[tuple[str, Any]], str] = {}
@@ -597,6 +745,14 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                             f"执行失败（已重试3次）：{str(result)}"
                         )
                         state.status = "failed"
+                        if state.task_plan is not None:
+                            state.task_plan = TaskManager.mark_task_failed(
+                                state.task_plan, tid, str(result)
+                            )
+                            state.task_plan = TaskManager.mark_plan_failed(
+                                state.task_plan
+                            )
+                            await _publish_task_progress(state, config)
                         return state
 
                     if result.get("status") == "input_required":
@@ -648,6 +804,14 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                         f"执行失败（已重试3次）：{str(final_result)}"
                     )
                     state.status = "failed"
+                    if state.task_plan is not None:
+                        state.task_plan = TaskManager.mark_task_failed(
+                            state.task_plan,
+                            input_required_tid,
+                            str(final_result),
+                        )
+                        state.task_plan = TaskManager.mark_plan_failed(state.task_plan)
+                        await _publish_task_progress(state, config)
                     return state
 
                 phase_results[input_required_tid] = final_result
@@ -686,13 +850,25 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 status="success",
                 artifacts=result.get("artifacts", []),
             )
+            if state.task_plan is not None:
+                state.task_plan = TaskManager.mark_task_completed(state.task_plan, tid)
 
+        await _publish_task_progress(state, config)
         state.current_phase_idx += 1
         return state
 
     def finalize(state: MainState) -> MainState:
         """组装原始结果到 final_artifacts。"""
+        if state.status == "cancelled":
+            if state.task_plan is not None:
+                cancel_message = TaskManager.build_cancel_message(state.task_plan)
+                state.summary = cancel_message
+                state.final_artifacts = [{"type": "text", "text": cancel_message}]
+            return state
+
         if state.status == "failed":
+            if state.task_plan is not None:
+                state.task_plan = TaskManager.mark_plan_failed(state.task_plan)
             state.final_artifacts = [
                 {"type": "text", "text": f"执行失败：{state.error_message}"}
             ]
@@ -704,6 +880,9 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                     }
                 )
             return state
+
+        if state.task_plan is not None:
+            state.task_plan = TaskManager.mark_plan_completed(state.task_plan)
 
         # 按 Phase 顺序组织原始结果
         raw_artifacts: List[Dict[str, Any]] = []
@@ -781,6 +960,8 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
 
     def route_after_execution(state: MainState) -> str:
         """条件路由：判断是否还有更多 Phase 需要执行。"""
+        if state.status == "cancelled":
+            return "handle_cancelled"
         if state.status == "failed":
             return "finalize"
         if state.current_phase_idx >= len(state.phases):
@@ -792,6 +973,9 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
 
     workflow.add_node("recognize_and_check", recognize_and_check)
     workflow.add_node("direct_reply", direct_reply)
+    workflow.add_node("prepare_plan", prepare_plan)
+    workflow.add_node("await_plan_approval", await_plan_approval)
+    workflow.add_node("handle_cancelled", handle_cancelled)
     workflow.add_node("build_phases", build_phases)
     workflow.add_node("execute_current_phase", execute_current_phase)
     workflow.add_node("finalize", finalize)
@@ -803,10 +987,22 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         route_after_recognize,
         {
             "direct_reply": "direct_reply",
-            "build_phases": "build_phases",
+            "prepare_plan": "prepare_plan",
         },
     )
     workflow.add_edge("direct_reply", END)
+    workflow.add_edge("prepare_plan", "await_plan_approval")
+    workflow.add_conditional_edges(
+        "await_plan_approval",
+        route_after_plan_approval,
+        {
+            "handle_cancelled": "handle_cancelled",
+            "recognize_and_check": "recognize_and_check",
+            "build_phases": "build_phases",
+            "await_plan_approval": "await_plan_approval",
+        },
+    )
+    workflow.add_edge("handle_cancelled", END)
     workflow.add_edge("build_phases", "execute_current_phase")
     workflow.add_conditional_edges(
         "execute_current_phase",
@@ -814,6 +1010,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         {
             "execute_current_phase": "execute_current_phase",
             "finalize": "finalize",
+            "handle_cancelled": "handle_cancelled",
         },
     )
     workflow.add_edge("finalize", "summarize")
@@ -825,6 +1022,9 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 ("intent_agent.models", "IntentResult"),
                 ("intent_agent.models", "SubTask"),
                 ("main_agent.models", "TaskOutput"),
+                ("main_agent.task_models", "ManagedTaskPlan"),
+                ("main_agent.task_models", "ManagedTask"),
+                ("main_agent.task_models", "ProgressEvent"),
             ]
         )
     )

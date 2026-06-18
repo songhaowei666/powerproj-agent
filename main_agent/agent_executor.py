@@ -17,12 +17,17 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.types import Command
 from langgraph.errors import GraphInterrupt
 
-from a2a_message_parser import build_agent_message_from_parts
+from a2a_message_parser import build_agent_message_from_parts, build_plan_confirm_parts
 from main_agent.agent_network import AgentNetwork
 from main_agent.graph import build_main_graph
 from main_agent.models import MainState
 from main_agent.executor import extract_artifact_text
-from main_agent.streaming import format_summary_chunk_message, format_trace_step_message
+from main_agent.task_manager import TaskManager
+from main_agent.streaming import (
+    format_summary_chunk_message,
+    format_trace_step_message,
+    format_task_progress_message,
+)
 
 
 TracePublisher = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -86,6 +91,20 @@ class _StreamPublisher:
             await self._updater.update_status(
                 a2a_pb2.TaskState.TASK_STATE_WORKING,
                 chunk_message,
+            )
+
+    async def publish_progress(self, progress_dict: Dict[str, Any]) -> None:
+        """推送任务计划进度快照。"""
+        async with self._lock:
+            await self._ensure_working()
+            progress_message = new_text_message(
+                text=format_task_progress_message(progress_dict),
+                context_id=self._context_id,
+                task_id=self._task_id,
+            )
+            await self._updater.update_status(
+                a2a_pb2.TaskState.TASK_STATE_WORKING,
+                progress_message,
             )
 
 
@@ -155,6 +174,7 @@ class MainAgentExecutor(AgentExecutor):
                 "thread_id": task_id,
                 "publish_trace": stream_publisher.publish_trace,
                 "publish_summary_chunk": stream_publisher.publish_summary_chunk,
+                "publish_progress": stream_publisher.publish_progress,
             }
         }
 
@@ -225,11 +245,26 @@ class MainAgentExecutor(AgentExecutor):
         if state and state.next:
             try:
                 interrupt_info = state.tasks[0].interrupts[0].value
-                question = interrupt_info.get("question", "请补充信息")
-                parts = interrupt_info.get("parts") or []
             except (IndexError, AttributeError):
-                question = "请补充更多信息"
-                parts = []
+                interrupt_info = {}
+
+            interrupt_type = interrupt_info.get("type")
+            question = interrupt_info.get("question", "请补充信息")
+            parts = interrupt_info.get("parts") or []
+
+            if interrupt_type == "plan_confirm":
+                plan_summary = interrupt_info.get("plan") or {}
+                body = plan_summary if isinstance(plan_summary, dict) else {}
+                text = TaskManager.build_plan_confirm_text_from_summary(body)
+                parts = build_plan_confirm_parts(text, body)
+            elif parts:
+                status_message = build_agent_message_from_parts(
+                    parts, context_id, task_id
+                )
+                await updater.update_status(
+                    a2a_pb2.TaskState.TASK_STATE_INPUT_REQUIRED, status_message
+                )
+                return
 
             if parts:
                 status_message = build_agent_message_from_parts(
@@ -251,6 +286,20 @@ class MainAgentExecutor(AgentExecutor):
         if not result_dict:
             result_dict = self._state_values_to_dict(invoke_result)
         status = result_dict.get("status", "completed")
+
+        if status == "cancelled":
+            final_text = (result_dict.get("summary") or "任务已取消").strip()
+            for artifact in result_dict.get("final_artifacts", []):
+                if artifact.get("type") == "text" and artifact.get("text"):
+                    final_text = artifact["text"]
+                    break
+            cancel_message = new_text_message(
+                text=final_text,
+                context_id=context_id,
+                task_id=task_id,
+            )
+            await updater.cancel(cancel_message)
+            return
 
         if status == "failed":
             error_msg = result_dict.get("error_message", "未知错误")
