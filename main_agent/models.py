@@ -41,6 +41,10 @@ class MainState(BaseModel):
     intent_result: Optional[IntentResult] = Field(
         default=None, description="意图识别结果"
     )
+    user_attachments: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="用户首轮消息附带的 raw/url 文件 parts，转发给业务 Agent",
+    )
     phases: List[List[str]] = Field(
         default_factory=list, description="拓扑分层结果，每个元素是同层subtask_id列表"
     )

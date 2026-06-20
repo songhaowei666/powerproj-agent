@@ -8,6 +8,7 @@ pydantic
 pydantic-settings
 starlette
 uvicorn
+python-multipart
 fastapi
 httpx
 

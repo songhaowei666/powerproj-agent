@@ -283,6 +283,46 @@ def _extract_file_links(state: MainState) -> List[Dict[str, str]]:
     return links
 
 
+def _filter_missing_texts_for_summarize(
+    raw_texts: List[str],
+    summary_text: str,
+    file_urls: List[str],
+) -> List[str]:
+    """过滤 summarize 附录中与总结或文件链接重复的原文。"""
+    # 仅为文件列表标题、且文件行已被 URL 去重时，不再单独附录
+    _file_section_headers = {"为您找到以下文件："}
+    filtered: List[str] = []
+    for text in raw_texts:
+        if not text or text in summary_text:
+            continue
+        if file_urls and any(url in text for url in file_urls):
+            continue
+        if file_urls and text.strip() in _file_section_headers:
+            continue
+        filtered.append(text)
+    return filtered
+
+
+def _build_file_links_appendix(
+    summary_text: str,
+    file_links: List[Dict[str, str]],
+) -> str:
+    """构建总结中尚未出现的文件下载链接附录。"""
+    pending = [
+        link
+        for link in file_links
+        if link.get("url") and link["url"] not in summary_text
+    ]
+    if not pending:
+        return ""
+
+    lines = "\n\n相关文件："
+    for link in pending:
+        name = link.get("name") or "文件"
+        lines += f"\n- [{name}]({link['url']})"
+    return lines
+
+
 # ---------- 节点实现 ----------
 
 
@@ -582,6 +622,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         task_outputs: Dict[str, TaskOutput],
         business_task_id: Optional[str] = None,
         resume_text: Optional[str] = None,
+        user_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[str, Any]:
         """调用业务 Agent，返回 (task_id, result_or_exception)。"""
         try:
@@ -593,6 +634,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                 subtask_map=subtask_map,
                 business_task_id=business_task_id,
                 resume_text=resume_text,
+                user_attachments=user_attachments,
             )
             return tid, result
         except Exception as exc:
@@ -717,6 +759,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
                             session_id,
                             subtask_map,
                             state.task_outputs,
+                            user_attachments=state.user_attachments,
                         )
                     )
                 ] = tid
@@ -933,6 +976,7 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
 
         user_message = _build_summarize_user_message(state)
         file_links = _extract_file_links(state)
+        file_urls = [link["url"] for link in file_links if link.get("url")]
         summary_publisher = _get_summary_publisher(config)
         summary_text = await _stream_llm_text(
             llm,
@@ -945,22 +989,19 @@ def build_main_graph(llm: BaseChatModel, agent_network: AgentNetwork):
         if not summary_text.strip():
             summary_text = "任务执行完成。以下是各业务 Agent 的原始结果："
 
-        # 确保总结包含业务 Agent 返回的具体数据
+        # 确保总结包含业务 Agent 返回的具体数据（跳过已在总结或文件链接中的原文）
         raw_texts = _collect_task_output_texts(state)
-        missing_texts = [text for text in raw_texts if text and text not in summary_text]
+        missing_texts = _filter_missing_texts_for_summarize(
+            raw_texts, summary_text, file_urls
+        )
         if missing_texts:
             appendix = "\n\n" + "\n\n".join(missing_texts)
             summary_text += appendix
             if summary_publisher is not None:
                 await summary_publisher(appendix)
 
-        # 附加文件链接引用
-        if file_links:
-            link_lines = "\n\n相关文件："
-            for link in file_links:
-                link_lines += (
-                    f"\n- {link['required_agent']}（{link['description']}）：{link['url']}"
-                )
+        link_lines = _build_file_links_appendix(summary_text, file_links)
+        if link_lines:
             summary_text += link_lines
             if summary_publisher is not None:
                 await summary_publisher(link_lines)

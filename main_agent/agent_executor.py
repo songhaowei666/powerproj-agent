@@ -17,7 +17,7 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.types import Command
 from langgraph.errors import GraphInterrupt
 
-from a2a_message_parser import build_agent_message_from_parts, build_plan_confirm_parts
+from a2a_message_parser import build_agent_message_from_parts, build_plan_confirm_parts, build_attachment_parts, parse_message_parts
 from main_agent.agent_network import AgentNetwork
 from main_agent.graph import build_main_graph
 from main_agent.models import MainState
@@ -203,7 +203,10 @@ class MainAgentExecutor(AgentExecutor):
             initial_task.status.state = a2a_pb2.TaskState.TASK_STATE_SUBMITTED
             await event_queue.enqueue_event(initial_task)
 
-        if not current_text:
+        parsed_current = parse_message_parts(message)
+        user_attachments = build_attachment_parts(parsed_current)
+
+        if not current_text and not user_attachments:
             updater = TaskUpdater(event_queue, task_id, context_id)
             error_msg = new_text_message(
                 text="无法从消息中提取文本内容",
@@ -212,6 +215,9 @@ class MainAgentExecutor(AgentExecutor):
             )
             await updater.failed(error_msg)
             return
+
+        if not current_text and user_attachments:
+            current_text = "请处理附件中的文件"
 
         full_query = self._build_query_from_history(task, current_text)
         updater = TaskUpdater(event_queue, task_id, context_id)
@@ -234,6 +240,7 @@ class MainAgentExecutor(AgentExecutor):
                 initial_state = MainState(
                     query=full_query,
                     session_id=session_id,
+                    user_attachments=user_attachments,
                 )
                 invoke_result = await self._graph.ainvoke(initial_state, config)
         except GraphInterrupt:

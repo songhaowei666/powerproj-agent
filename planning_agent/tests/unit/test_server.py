@@ -19,7 +19,7 @@ from starlette.testclient import TestClient
 from a2a_base import get_a2a_app
 from planning_agent.database import ProjectDatabase
 from planning_agent.file_manager import FileManager
-from planning_agent.server import AGENT_CARD, PlanningAgentExecutor, download_file
+from planning_agent.server import AGENT_CARD, PlanningAgentExecutor, download_file, upload_file_http
 
 
 # ---------- Mock LLM ----------
@@ -114,30 +114,21 @@ def test_client(mock_llm):
     fm = FileManager(base_dir=fm_dir)
     executor = PlanningAgentExecutor(llm=mock_llm, db=db, fm=fm)
 
-    # 测试专用的文件下载路由
-    async def _download_file(request):
-        file_id = request.path_params["file_id"]
-        file_info = db.get_file_by_id(file_id)
-        if not file_info:
-            return JSONResponse(
-                status_code=404, content={"error": f"File not found: {file_id}"}
-            )
-        file_path = fm.get_file_path_by_location(
-            file_info["project_code"],
-            file_info["node_code"],
-            file_info["file_name"],
-        )
-        if not file_path or not file_path.exists():
-            return JSONResponse(
-                status_code=404,
-                content={"error": f"File not found on disk: {file_id}"},
-            )
-        return FileResponse(
-            path=str(file_path),
-            filename=file_info.get("file_name", file_path.name),
-        )
+    # 测试专用文件 HTTP 路由（与 server.EXTRA_ROUTES 一致）
+    async def _upload_file(request):
+        with patch("planning_agent.server.fm_instance", fm):
+            return await upload_file_http(request)
 
-    extra_routes = [Route("/files/{file_id}", _download_file, methods=["GET"])]
+    async def _download_file(request):
+        with patch("planning_agent.server.db_instance", db), patch(
+            "planning_agent.server.fm_instance", fm
+        ):
+            return await download_file(request)
+
+    extra_routes = [
+        Route("/files/upload", _upload_file, methods=["POST"]),
+        Route("/files/{file_id}", _download_file, methods=["GET"]),
+    ]
 
     app = get_a2a_app(executor, AGENT_CARD, extra_routes=extra_routes)
 
@@ -426,6 +417,25 @@ class TestTasksGetCancel:
         assert result["status"]["state"] == "TASK_STATE_CANCELED"
 
 
+class TestFileUploadHttp:
+    """HTTP 暂存上传接口测试。"""
+
+    def test_upload_and_download_staging(self, test_client):
+        """POST /files/upload 后可通过 GET /files/{id} 下载。"""
+        resp = test_client.post(
+            "/files/upload",
+            files={"file": ("report.pdf", b"staging-content", "application/pdf")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["file_id"]
+        assert data["url"].endswith(f"/files/{data['file_id']}")
+
+        download = test_client.get(f"/files/{data['file_id']}")
+        assert download.status_code == 200
+        assert download.content == b"staging-content"
+
+
 class TestFileDownload:
     """文件下载路由测试。"""
 
@@ -532,9 +542,13 @@ class TestServerDownloadFile:
         request.path_params = {"file_id": "not-exist"}
 
         with patch("planning_agent.server.db_instance.get_file_by_id", return_value=None):
-            resp = await download_file(request)
-            assert resp.status_code == 404
-            assert "not-exist" in resp.body.decode()
+            with patch(
+                "planning_agent.server.fm_instance.get_staging_file_path",
+                return_value=None,
+            ):
+                resp = await download_file(request)
+                assert resp.status_code == 404
+                assert "not-exist" in resp.body.decode()
 
     @pytest.mark.asyncio
     async def test_download_file_missing_on_disk(self):
@@ -551,7 +565,7 @@ class TestServerDownloadFile:
         with patch("planning_agent.server.db_instance.get_file_by_id", return_value=file_info):
             resp = await download_file(request)
             assert resp.status_code == 404
-            assert "not found on disk" in resp.body.decode()
+            assert "File not found" in resp.body.decode()
 
     @pytest.mark.asyncio
     async def test_download_file_success(self):

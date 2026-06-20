@@ -5,6 +5,7 @@
 - 以「【前置任务」开头的 text part：前置任务分段标题
 - 后续 text/url part：归入当前前置分段
 - raw part：用户上传文件（与前置任务无关）
+- url part（主消息内）：用户提供的文件地址附件
 """
 
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ class ParsedInput:
     task_query: str
     upstream_sections: List[UpstreamSection] = field(default_factory=list)
     raw_files: List[Dict[str, Any]] = field(default_factory=list)
+    attachment_files: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def build_upstream_header(task_id: str, capability: str, name: str) -> str:
@@ -90,6 +92,7 @@ def parse_parts_list(parts: List[Dict[str, Any]]) -> ParsedInput:
     task_query = ""
     upstream_sections: List[UpstreamSection] = []
     raw_files: List[Dict[str, Any]] = []
+    attachment_files: List[Dict[str, Any]] = []
     current_section: Optional[UpstreamSection] = None
 
     for part in parts:
@@ -134,11 +137,20 @@ def parse_parts_list(parts: List[Dict[str, Any]]) -> ParsedInput:
                 current_section.parts.append(normalized)
             elif upstream_sections:
                 upstream_sections[-1].parts.append(normalized)
+            else:
+                attachment_files.append(
+                    {
+                        "url": normalized["url"],
+                        "name": normalized.get("filename") or "文件",
+                    }
+                )
+            continue
 
     return ParsedInput(
         task_query=task_query,
         upstream_sections=upstream_sections,
         raw_files=raw_files,
+        attachment_files=attachment_files,
     )
 
 

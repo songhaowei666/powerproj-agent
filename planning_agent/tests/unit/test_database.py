@@ -99,29 +99,32 @@ class TestDatabase:
         assert result["total_capacity"] is None
 
     def test_file_record_cover(self, temp_db):
-        """同名文件覆盖（同一记录更新 file_path）。"""
-        temp_db.add_file_record(
+        """同名文件覆盖（同一记录更新 file_path，保留原 file_id）。"""
+        first_id = temp_db.add_file_record(
             project_code="PRJ001",
             node_code="001",
             file_id="test-uuid-1",
             file_name="report.pdf",
             file_path="upload_files/PRJ001/001/report.pdf",
         )
+        assert first_id == "test-uuid-1"
         files = temp_db.list_files("PRJ001", "001")
         assert len(files) == 1
         assert files[0]["file_path"] == "upload_files/PRJ001/001/report.pdf"
 
         # 覆盖同名文件
-        temp_db.add_file_record(
+        second_id = temp_db.add_file_record(
             project_code="PRJ001",
             node_code="001",
             file_id="test-uuid-2",
             file_name="report.pdf",
             file_path="upload_files/PRJ001/001/report_v2.pdf",
         )
+        assert second_id == "test-uuid-1"
         files = temp_db.list_files("PRJ001", "001")
         assert len(files) == 1
         assert files[0]["file_path"] == "upload_files/PRJ001/001/report_v2.pdf"
+        assert files[0]["file_id"] == "test-uuid-1"
 
         # 清理
         temp_db.delete_file_record("test-uuid-1")

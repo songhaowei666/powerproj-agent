@@ -243,8 +243,12 @@ class ProjectDatabase:
         file_id: str,
         file_name: str,
         file_path: str,
-    ) -> None:
-        """添加或更新文件记录（同名覆盖）。"""
+    ) -> str:
+        """添加或更新文件记录（同名覆盖）。
+
+        Returns:
+            实际生效的 file_id（同名覆盖时保留原 id）。
+        """
         with self._connect() as conn:
             # 先检查同项目同节点同名文件是否存在
             cursor = conn.execute(
@@ -253,17 +257,19 @@ class ProjectDatabase:
             )
             existing = cursor.fetchone()
             if existing:
-                # 覆盖：更新 file_path 和 created_at
+                effective_id = existing["file_id"]
                 conn.execute(
                     "UPDATE project_node_files SET file_path = ?, created_at = CURRENT_TIMESTAMP WHERE file_id = ?",
-                    (file_path, existing["file_id"]),
+                    (file_path, effective_id),
                 )
             else:
+                effective_id = file_id
                 conn.execute(
                     "INSERT INTO project_node_files (project_code, node_code, file_id, file_name, file_path) VALUES (?, ?, ?, ?, ?)",
                     (project_code, node_code, file_id, file_name, file_path),
                 )
             conn.commit()
+            return effective_id
 
     def list_files(
         self,

@@ -172,3 +172,49 @@ class TestFileManager:
         """URL 格式正确。"""
         url = temp_fm.build_download_url("uuid-123", "http://localhost:8001")
         assert url == "http://localhost:8001/files/uuid-123"
+
+    def test_save_staging_and_commit(self, temp_fm):
+        """暂存上传后可 commit 到项目节点并保留 file_id。"""
+        file_id = temp_fm.save_staging_file(b"staging bytes", "stage.pdf")
+        assert temp_fm.get_staging_file_path(file_id) is not None
+
+        committed_id, target_path = temp_fm.commit_staging_file(
+            file_id, "PRJ001", "001"
+        )
+        assert committed_id == file_id
+        assert target_path.read_bytes() == b"staging bytes"
+        assert temp_fm.get_staging_file_path(file_id) is None
+
+    def test_extract_file_id_from_url(self):
+        """从 files URL 提取 file_id。"""
+        file_id = FileManager.extract_file_id_from_url(
+            "http://localhost:8001/files/abc-123"
+        )
+        assert file_id == "abc-123"
+
+    def test_resolve_download_path_relative(self, temp_fm):
+        """相对路径（project/node/file）可正确解析。"""
+        temp_fm.save_uploaded_file(
+            project_code="PRJ001",
+            node_code="001",
+            file_name="report.pdf",
+            content_bytes=b"report content",
+        )
+        path = temp_fm.resolve_download_path(
+            "any-id", "PRJ001/001/report.pdf"
+        )
+        assert path is not None
+        assert path.read_bytes() == b"report content"
+
+    def test_resolve_download_path_legacy_prefix(self, temp_fm):
+        """兼容含 upload_files 前缀的历史 file_path。"""
+        temp_fm.save_uploaded_file(
+            project_code="PRJ001",
+            node_code="001",
+            file_name="legacy.pdf",
+            content_bytes=b"legacy content",
+        )
+        legacy_path = f"{temp_fm.base_dir}/PRJ001/001/legacy.pdf"
+        path = temp_fm.resolve_download_path("legacy-id", legacy_path)
+        assert path is not None
+        assert path.read_bytes() == b"legacy content"

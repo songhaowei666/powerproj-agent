@@ -248,6 +248,14 @@ class TestGraph:
         )
         assert result.get("status") == "completed"
         assert "成功上传" in result.get("result_text", "")
+        assert "/files/" in result.get("result_text", "")
+
+        file_artifacts = [
+            art for art in result.get("artifacts", []) if art.get("type") == "file"
+        ]
+        assert len(file_artifacts) == 1
+        assert file_artifacts[0]["file"]["name"] == "design.pdf"
+        assert "/files/" in file_artifacts[0]["file"]["uri"]
 
         files = temp_db.list_files("PRJ001", "001")
         assert len(files) == 1

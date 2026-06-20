@@ -1287,3 +1287,53 @@ class TestParseChatResponse:
         assert result.confirmation.action == "project_confirm"
         assert len(result.confirmation.options) == 2
         assert "请在下方输入补充信息" not in result.text
+
+
+class TestSummarizeDedup:
+    """summarize 附录去重逻辑测试。"""
+
+    def test_filter_missing_texts_skips_file_listing(self):
+        from main_agent.graph import _filter_missing_texts_for_summarize
+
+        url = "http://localhost:8001/files/abc-123"
+        raw = [f"成功上传 1 个文件到「可研设计」节点：\n- [a.docx]({url})"]
+        result = _filter_missing_texts_for_summarize(
+            raw, "LLM 已总结上传成功", [url]
+        )
+        assert result == []
+
+    def test_filter_missing_texts_skips_orphan_file_header(self):
+        from main_agent.graph import _filter_missing_texts_for_summarize
+
+        url = "http://localhost:8001/files/abc-123"
+        raw = [
+            "为您找到以下文件：",
+            f"- [a.docx]({url}) (可研设计) - 上传时间：2026-06-20",
+        ]
+        result = _filter_missing_texts_for_summarize(
+            raw, "LLM 已列出文件及下载链接", [url]
+        )
+        assert result == []
+
+    def test_filter_missing_texts_keeps_unrelated_appendix(self):
+        from main_agent.graph import _filter_missing_texts_for_summarize
+
+        raw = ["【聚合查询结果】\n线路长度总和：120.5"]
+        result = _filter_missing_texts_for_summarize(raw, "LLM 总结", [])
+        assert result == raw
+
+    def test_build_file_links_appendix_skips_existing_url(self):
+        from main_agent.graph import _build_file_links_appendix
+
+        url = "http://localhost:8001/files/abc-123"
+        links = [{"url": url, "name": "a.docx"}]
+        assert _build_file_links_appendix(f"下载地址：{url}", links) == ""
+
+    def test_build_file_links_appendix_adds_missing_url(self):
+        from main_agent.graph import _build_file_links_appendix
+
+        url = "http://localhost:8001/files/abc-123"
+        links = [{"url": url, "name": "a.docx"}]
+        appendix = _build_file_links_appendix("上传已完成。", links)
+        assert "相关文件" in appendix
+        assert f"[a.docx]({url})" in appendix

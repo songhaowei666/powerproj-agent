@@ -1,6 +1,7 @@
 """主控 Agent A2A 聊天客户端（流式）。"""
 
 import json
+import base64
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -77,6 +78,7 @@ class MainAgentClient:
         task_id: Optional[str] = None,
         context_id: Optional[str] = None,
         on_event: Optional[Callable[[StreamEvent], None]] = None,
+        attachment_parts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """向主控 Agent 发送单条消息（流式接收）。
 
@@ -85,6 +87,7 @@ class MainAgentClient:
             task_id: 已有任务 ID，用于继续对话或恢复中断
             context_id: 会话 context ID，续传 task 时必须与首轮一致
             on_event: 流式事件回调，用于 UI 实时刷新
+            attachment_parts: 附加 raw/url 文件 parts
 
         Returns:
             包含 status、detail、data、task_id、context_id 的结果字典
@@ -96,6 +99,7 @@ class MainAgentClient:
                 task_id,
                 context_id,
                 on_event,
+                attachment_parts,
             )
 
     async def check_connectivity(self) -> bool:
@@ -107,6 +111,39 @@ class MainAgentClient:
         except Exception:
             return False
 
+    @staticmethod
+    def _build_attachment_part(attachment: Dict[str, Any]) -> Optional[Part]:
+        """将附件 dict 转为 A2A Part。"""
+        if attachment.get("raw") is not None:
+            raw = attachment["raw"]
+            if isinstance(raw, str):
+                try:
+                    raw_bytes = base64.b64decode(raw)
+                except Exception:
+                    raw_bytes = raw.encode("utf-8")
+            else:
+                raw_bytes = bytes(raw)
+            return Part(
+                raw=raw_bytes,
+                filename=attachment.get("filename")
+                or attachment.get("name")
+                or "unnamed",
+                media_type=attachment.get("mediaType")
+                or attachment.get("media_type")
+                or "",
+            )
+
+        url = str(attachment.get("url") or "").strip()
+        if url:
+            return Part(
+                url=url,
+                filename=attachment.get("filename") or attachment.get("name") or "文件",
+                media_type=attachment.get("mediaType")
+                or attachment.get("media_type")
+                or "",
+            )
+        return None
+
     async def _send_streaming_message(
         self,
         client: httpx.AsyncClient,
@@ -114,6 +151,7 @@ class MainAgentClient:
         task_id: Optional[str] = None,
         context_id: Optional[str] = None,
         on_event: Optional[Callable[[StreamEvent], None]] = None,
+        attachment_parts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """底层：通过 A2A SDK 流式发送 SendMessage 请求。"""
         try:
@@ -130,9 +168,19 @@ class MainAgentClient:
         config = ClientConfig(httpx_client=client, streaming=True)
         a2a_client = ClientFactory(config).create(agent_card)
 
+        parts: List[Part] = []
+        if message_text:
+            parts.append(Part(text=message_text))
+        for attachment in attachment_parts or []:
+            proto_part = self._build_attachment_part(attachment)
+            if proto_part is not None:
+                parts.append(proto_part)
+        if not parts:
+            parts.append(Part(text=""))
+
         message = Message(
             role=Role.ROLE_USER,
-            parts=[Part(text=message_text)],
+            parts=parts,
             message_id=uuid4().hex,
         )
         if task_id:

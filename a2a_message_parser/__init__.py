@@ -20,6 +20,7 @@ from a2a_message_parser.message_builder import (
     message_to_parts_dicts,
     parts_dicts_to_proto,
 )
+from a2a_message_parser.attachments import build_attachment_parts
 from a2a_message_parser.parser import (
     UPSTREAM_MARKER_PREFIX,
     ParsedInput,
@@ -45,6 +46,7 @@ __all__ = [
     "build_plan_confirm_data",
     "build_plan_confirm_parts",
     "build_agent_message_from_parts",
+    "build_attachment_parts",
     "format_upstream_context",
     "message_to_parts_dicts",
     "parse_confirmation_from_parts",

@@ -17,6 +17,18 @@ def parts_dicts_to_proto(parts: List[Dict[str, Any]]) -> List[a2a_pb2.Part]:
         elif part.get("url"):
             proto_part.url = part["url"]
             proto_part.filename = part.get("filename") or part.get("name") or ""
+        elif part.get("raw") is not None:
+            raw = part["raw"]
+            if isinstance(raw, str):
+                import base64
+
+                try:
+                    proto_part.raw = base64.b64decode(raw)
+                except Exception:
+                    proto_part.raw = raw.encode("utf-8")
+            else:
+                proto_part.raw = bytes(raw)
+            proto_part.filename = part.get("filename") or part.get("name") or "unnamed"
         elif part.get("data") is not None:
             data_value = Value()
             json_format.ParseDict(part["data"], data_value)

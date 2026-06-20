@@ -16,11 +16,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
+import httpx
 
 from streamlits.client import MainAgentClient, StreamEvent, parse_chat_response, ConfirmationUI
 from main_agent.task_manager import format_plan_approve_reply
 
 DEFAULT_BASE_URL = "http://localhost:8000"
+DEFAULT_PLANNING_URL = "http://localhost:8001"
 
 st.set_page_config(
     page_title="电网智能助手",
@@ -50,6 +52,8 @@ def _init_session_state() -> None:
         st.session_state.seen_trace_steps = set()
     if "base_url" not in st.session_state:
         st.session_state.base_url = DEFAULT_BASE_URL
+    if "planning_url" not in st.session_state:
+        st.session_state.planning_url = DEFAULT_PLANNING_URL
 
 
 def _reset_conversation() -> None:
@@ -120,7 +124,7 @@ def _build_trace_title(trace: dict, *, turn_index: int, intent_index: int) -> st
     )
 
 
-def _render_sidebar() -> str:
+def _render_sidebar() -> tuple[str, str]:
     """渲染侧边栏并返回当前服务地址。"""
     with st.sidebar:
         st.header("设置")
@@ -131,17 +135,39 @@ def _render_sidebar() -> str:
         )
         st.session_state.base_url = base_url.rstrip("/")
 
+        planning_url = st.text_input(
+            "规划 Agent 地址",
+            value=st.session_state.planning_url,
+            placeholder=DEFAULT_PLANNING_URL,
+            help="本地文件会先通过 HTTP 上传到规划 Agent，再在对话中引用 file URL",
+        )
+        st.session_state.planning_url = planning_url.rstrip("/")
+
         if st.button("新对话", use_container_width=True):
             _reset_conversation()
             st.rerun()
+
+        st.divider()
+        st.markdown("**文件附件（可选）**")
+        st.file_uploader(
+            "上传本地文件",
+            key="chat_upload_file",
+            help="用于规划 Agent 上传节点文件等场景",
+        )
+        st.text_input(
+            "或填写文件 URL",
+            key="chat_file_url",
+            placeholder="https://example.com/files/design.pdf",
+        )
 
         st.divider()
         st.markdown("**使用说明**")
         st.markdown(
             "1. 先启动主控 Agent（端口 8000）及业务 Agent\n"
             "2. 输入自然语言问题，例如统计、规划、投资相关需求\n"
-            "3. 计划确认时可勾选子任务并点「开始执行」，业务确认可点「是/否」\n"
-            "4. 调用轨迹与总结会在处理过程中实时更新"
+            "3. 上传文件时会先 POST 到规划 Agent，对话中仅传文件 URL\n"
+            "4. 计划确认时可勾选子任务并点「开始执行」，业务确认可点「是/否」\n"
+            "5. 调用轨迹与总结会在处理过程中实时更新"
         )
 
         if st.session_state.task_id:
@@ -149,7 +175,7 @@ def _render_sidebar() -> str:
             st.text("当前任务 ID")
             st.code(st.session_state.task_id, language=None)
 
-    return st.session_state.base_url
+    return st.session_state.base_url, st.session_state.planning_url
 
 
 def _render_invocation_traces(traces: list[dict]) -> None:
@@ -181,12 +207,53 @@ def _check_service_online(base_url: str) -> bool:
     return asyncio.run(client.check_connectivity())
 
 
+def _upload_local_file_to_planning(planning_url: str, uploaded) -> dict:
+    """通过 multipart/form-data 上传到规划 Agent，返回 url part。"""
+    files = {
+        "file": (
+            uploaded.name,
+            uploaded.getvalue(),
+            uploaded.type or "application/octet-stream",
+        )
+    }
+    resp = httpx.post(
+        f"{planning_url.rstrip('/')}/files/upload",
+        files=files,
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return {
+        "url": data["url"],
+        "filename": data.get("filename") or uploaded.name,
+    }
+
+
+def _collect_chat_attachment_parts(planning_url: str) -> list[dict]:
+    """从侧边栏控件收集本轮要发送的文件附件（均为 url part）。"""
+    parts: list[dict] = []
+    uploaded = st.session_state.get("chat_upload_file")
+    if uploaded is not None:
+        try:
+            parts.append(_upload_local_file_to_planning(planning_url, uploaded))
+        except httpx.HTTPError as exc:
+            st.error(f"文件上传到规划 Agent 失败：{exc}")
+            return []
+
+    file_url = str(st.session_state.get("chat_file_url") or "").strip()
+    if file_url:
+        filename = file_url.rsplit("/", 1)[-1] or "文件"
+        parts.append({"url": file_url, "filename": filename})
+    return parts
+
+
 async def _send_streaming_to_main_agent(
     base_url: str,
     message: str,
     task_id: str | None,
     context_id: str | None,
     on_event,
+    attachment_parts: list[dict] | None = None,
 ):
     """流式发送消息到主控 Agent。"""
     client = MainAgentClient(base_url=base_url)
@@ -195,6 +262,7 @@ async def _send_streaming_to_main_agent(
         task_id,
         context_id=context_id,
         on_event=on_event,
+        attachment_parts=attachment_parts,
     )
 
 
@@ -371,6 +439,7 @@ def _process_assistant_response(
     user_prompt: str,
     send_task_id: str | None,
     send_context_id: str | None,
+    attachment_parts: list[dict] | None = None,
 ) -> None:
     """发送消息并渲染助手回复（含确认按钮）。"""
     if send_task_id is None:
@@ -387,6 +456,7 @@ def _process_assistant_response(
             trace_slot,
             text_slot,
             turn_traces,
+            attachment_parts,
         )
         chat_resp = parse_chat_response(raw_result)
         if not turn_traces and chat_resp.invocation_traces:
@@ -438,6 +508,7 @@ def _send_to_main_agent(
     trace_slot,
     text_slot,
     turn_traces: list[dict],
+    attachment_parts: list[dict] | None = None,
 ):
     """同步包装：流式请求并在占位符中实时刷新（轨迹在上，正文在下）。"""
     summary_parts: list[str] = []
@@ -461,12 +532,13 @@ def _send_to_main_agent(
             task_id,
             context_id,
             _on_event,
+            attachment_parts,
         )
     )
 
 
 _init_session_state()
-base_url = _render_sidebar()
+base_url, planning_url = _render_sidebar()
 
 is_online = _check_service_online(base_url)
 if is_online:
@@ -525,9 +597,15 @@ prompt = st.chat_input(
     "请输入您的问题，例如：帮我统计今年的投资收益并做明年规划",
 )
 if prompt:
+    attachment_parts = _collect_chat_attachment_parts(planning_url)
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+        for attachment in attachment_parts:
+            if attachment.get("filename"):
+                st.caption(f"附件: {attachment['filename']}")
+            elif attachment.get("url"):
+                st.caption(f"附件 URL: {attachment['url']}")
 
     with st.chat_message("assistant"):
         if not is_online:
@@ -550,4 +628,5 @@ if prompt:
                 user_prompt=prompt,
                 send_task_id=send_task_id,
                 send_context_id=send_context_id,
+                attachment_parts=attachment_parts,
             )

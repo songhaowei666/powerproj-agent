@@ -21,6 +21,7 @@ from a2a_message_parser import (
 from providers.llm_provider import get_llm
 from planning_agent.database import ProjectDatabase
 from planning_agent.file_manager import FileManager
+from planning_agent.file_input import resolve_pending_files
 from planning_agent.graph import build_planning_graph
 from planning_agent.models import PlanningState
 
@@ -54,6 +55,23 @@ class PlanningAgentExecutor(AgentExecutor):
             )
         return pending_files
 
+    @staticmethod
+    def _serialize_pending_files(pending_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """LangGraph resume 更新用的 pending_files 结构。"""
+        serialized: List[Dict[str, Any]] = []
+        for item in pending_files:
+            content = item.get("content")
+            if isinstance(content, bytes):
+                content = base64.b64encode(content).decode()
+            serialized.append(
+                {
+                    "name": item.get("name") or "unnamed",
+                    "content": content,
+                    "mime_type": item.get("mime_type", ""),
+                }
+            )
+        return serialized
+
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """取消任务。"""
         updater = TaskUpdater(
@@ -85,7 +103,7 @@ class PlanningAgentExecutor(AgentExecutor):
         current_text = parsed.task_query or (
             get_message_text(message) if message else ""
         )
-        pending_files = self._build_pending_files(parsed.raw_files)
+        pending_files = await resolve_pending_files(parsed, file_manager=self._fm)
         upstream_context = format_upstream_context(parsed)
 
         # SDK 要求：必须先发送一个 Task 事件，然后才能发送 TaskStatusUpdateEvent
@@ -117,9 +135,14 @@ class PlanningAgentExecutor(AgentExecutor):
             graph_state = await self._graph.aget_state(config)
 
             if graph_state and graph_state.next:
-                # 图处于中断状态 -> 恢复执行
+                # 图处于中断状态 -> 恢复执行；若本轮消息携带文件则合并进状态
+                resume_kwargs: Dict[str, Any] = {"resume": current_text}
+                if pending_files:
+                    resume_kwargs["update"] = {
+                        "pending_files": self._serialize_pending_files(pending_files),
+                    }
                 result = await self._graph.ainvoke(
-                    Command(resume=current_text), config
+                    Command(**resume_kwargs), config
                 )
             else:
                 # 新请求

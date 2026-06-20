@@ -131,6 +131,7 @@ def build_task_parts(
     subtask: SubTask,
     task_outputs: Dict[str, TaskOutput],
     subtask_map: Dict[str, SubTask],
+    user_attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """构建发送给业务 Agent 的 message.parts，注入前置依赖任务结果。
 
@@ -138,6 +139,7 @@ def build_task_parts(
         subtask: 当前待执行的子任务
         task_outputs: 已完成任务的输出，key 为 task_id
         subtask_map: 全部子任务定义，用于补充前置任务描述
+        user_attachments: 用户消息附带的 raw/url parts
 
     Returns:
         parts 列表，首项为当前任务 text，后续为前置任务分段及原始 parts
@@ -170,6 +172,9 @@ def build_task_parts(
             parts.extend(dep_parts)
         else:
             parts.append({"text": "（无结果）"})
+
+    if user_attachments:
+        parts.extend(user_attachments)
 
     return parts
 
@@ -243,6 +248,24 @@ def _build_send_message_payload(
             proto_part = req.message.parts.add()
             proto_part.url = url
             proto_part.filename = part.get("filename") or part.get("name") or "文件"
+            continue
+        if part.get("raw") is not None:
+            import base64
+
+            proto_part = req.message.parts.add()
+            raw = part["raw"]
+            if isinstance(raw, str):
+                try:
+                    proto_part.raw = base64.b64decode(raw)
+                except Exception:
+                    proto_part.raw = raw.encode("utf-8")
+            else:
+                proto_part.raw = bytes(raw)
+            proto_part.filename = part.get("filename") or part.get("name") or "unnamed"
+            media_type = part.get("mediaType") or part.get("media_type") or ""
+            if media_type:
+                proto_part.media_type = media_type
+            continue
     req.configuration.CopyFrom(SendMessageConfiguration())
     return {
         "jsonrpc": "2.0",
@@ -260,6 +283,7 @@ async def call_business_agent(
     subtask_map: Optional[Dict[str, SubTask]] = None,
     business_task_id: Optional[str] = None,
     resume_text: Optional[str] = None,
+    user_attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """调用下游业务 Agent 的 A2A JSON-RPC 接口。
 
@@ -294,6 +318,7 @@ async def call_business_agent(
             subtask,
             task_outputs or {},
             subtask_map or {subtask.id: subtask},
+            user_attachments=user_attachments,
         )
         # 首次调用不传 task_id，由业务 Agent 创建任务；续聊时才携带已有 id
         request_task_id = business_task_id

@@ -1,10 +1,13 @@
 """Planning Agent A2A Server - 基于 DefaultRequestHandler + AgentExecutor。
 
-使用 a2a_base.get_a2a_app 创建 Starlette app，额外挂载 /files/{file_id} 文件下载路由。
+使用 a2a_base.get_a2a_app 创建 Starlette app，额外挂载文件 HTTP 接口：
+- POST /files/upload  multipart/form-data 暂存上传
+- GET  /files/{file_id} 下载（暂存或已入库文件）
 """
 
 from pathlib import Path
 
+from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
@@ -69,32 +72,77 @@ def _build_agent_card() -> a2a_pb2.AgentCard:
 AGENT_CARD = _build_agent_card()
 
 
-# ---------- 文件下载路由 ----------
+# ---------- 文件 HTTP 接口 ----------
 
 
 db_instance = ProjectDatabase()
 fm_instance = FileManager()
 
 
-async def download_file(request):
-    """文件下载 handler。"""
+def _request_base_url(request: Request) -> str:
+    """构造当前服务的 base URL。"""
+    return f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
+
+
+async def upload_file_http(request: Request):
+    """multipart/form-data 暂存上传，返回 file_id 与 download URL。"""
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "缺少 form 字段 file"},
+        )
+
+    filename = getattr(upload, "filename", None) or "unnamed"
+    content = await upload.read()
+    if not content:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "上传文件内容为空"},
+        )
+
+    file_id = fm_instance.save_staging_file(content, filename)
+    base_url = _request_base_url(request)
+    return JSONResponse(
+        {
+            "file_id": file_id,
+            "filename": Path(filename).name,
+            "url": fm_instance.build_download_url(file_id, base_url),
+        }
+    )
+
+
+async def download_file(request: Request):
+    """文件下载 handler（支持已入库与暂存文件）。"""
     file_id = request.path_params["file_id"]
     file_info = db_instance.get_file_by_id(file_id)
-    if not file_info:
-        return JSONResponse(
-            status_code=404, content={"error": f"File not found: {file_id}"}
+    download_name = "file"
+    file_path: Path | None = None
+
+    if file_info:
+        download_name = file_info.get("file_name") or download_name
+        file_path = fm_instance.resolve_download_path(
+            file_id, file_info.get("file_path")
         )
-    file_path = Path(file_info["file_path"])
-    if not file_path.exists():
+    else:
+        file_path = fm_instance.get_staging_file_path(file_id)
+        if file_path is not None:
+            download_name = file_path.name
+
+    if file_path is None or not file_path.exists():
         return JSONResponse(
-            status_code=404, content={"error": f"File not found on disk: {file_id}"}
+            status_code=404,
+            content={"error": f"File not found: {file_id}"},
         )
+
     return FileResponse(
         path=str(file_path),
-        filename=file_info.get("file_name", file_path.name),
+        filename=download_name,
     )
 
 
 EXTRA_ROUTES = [
+    Route("/files/upload", upload_file_http, methods=["POST"]),
     Route("/files/{file_id}", download_file, methods=["GET"]),
 ]

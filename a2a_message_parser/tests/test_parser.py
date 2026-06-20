@@ -49,6 +49,18 @@ class TestParsePartsList:
         assert parsed.raw_files[0]["name"] == "design.pdf"
         assert parsed.raw_files[0]["content"] == b"pdf-content"
 
+    def test_url_attachment_in_main_message(self):
+        parsed = parse_parts_list(
+            [
+                {"text": "北京西项目上传可研设计文件"},
+                {"url": "http://localhost:8001/files/abc", "filename": "design.pdf"},
+            ]
+        )
+        assert parsed.task_query == "北京西项目上传可研设计文件"
+        assert len(parsed.attachment_files) == 1
+        assert parsed.attachment_files[0]["url"].endswith("/files/abc")
+        assert parsed.attachment_files[0]["name"] == "design.pdf"
+
     def test_format_upstream_context(self):
         header = build_upstream_header("t1", "skill-a", "统计")
         parsed = parse_parts_list(
