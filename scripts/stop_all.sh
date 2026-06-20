@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# 停止所有 Agent 和 Web 服务
+# 停止所有 Agent 和 Streamlit 聊天页
 
 patterns=(
     "planning_agent/main.py"
     "investment_agent/main.py"
     "statistics_agent/main.py"
     "main_agent/server.py"
-    "uvicorn web.server:app"
+    "streamlits/app.py"
 )
 
 for pattern in "${patterns[@]}"; do

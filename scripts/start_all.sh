@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 启动三个业务 Agent、主控 Agent 和 Web 聊天页
+# 启动三个业务 Agent、主控 Agent 和 Streamlit 聊天页
 
 set -e
 
@@ -35,17 +35,17 @@ echo "=== 启动主控 Agent ==="
 start_service "main" "python -u main_agent/server.py"
 sleep 3
 
-echo "=== 启动 Web 聊天页 ==="
-start_service "web" "uvicorn web.server:app --host 0.0.0.0 --port 8501"
+echo "=== 启动 Streamlit 聊天页 ==="
+start_service "streamlit" "streamlit run streamlits/app.py --server.port 8501 --server.address 0.0.0.0"
 sleep 3
 
 echo ""
 echo "=== 服务地址 ==="
-echo "规划 Agent:   http://localhost:8001"
-echo "投资 Agent:   http://localhost:8002"
-echo "统计 Agent:   http://localhost:8003"
-echo "主控 Agent:   http://localhost:8000"
-echo "Web 聊天页:   http://localhost:8501"
+echo "规划 Agent:       http://localhost:8001"
+echo "投资 Agent:       http://localhost:8002"
+echo "统计 Agent:       http://localhost:8003"
+echo "主控 Agent:       http://localhost:8000"
+echo "Streamlit 聊天页: http://localhost:8501"
 echo ""
-echo "查看进程: pgrep -fl 'planning_agent/main|investment_agent/main|statistics_agent/main|main_agent/server|uvicorn web.server'"
+echo "查看进程: pgrep -fl 'planning_agent/main|investment_agent/main|statistics_agent/main|main_agent/server|streamlits/app.py'"
 echo "停止服务: bash scripts/stop_all.sh"

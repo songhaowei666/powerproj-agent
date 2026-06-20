@@ -4,39 +4,95 @@
 
 ## 系统架构
 
-用户请求统一进入 **主控 Agent (Main Agent)**，由它调用意图识别模块解析任务，再按依赖关系分阶段调度下游业务 Agent，最后汇总各任务结果返回。除 curl / A2A Client 外，也可通过 **Web 聊天页**（`:8501`）交互。
+用户请求统一进入 **主控 Agent (Main Agent)**，由它调用内嵌的意图识别模块解析任务，经用户确认执行计划后，按依赖关系分阶段调度下游业务 Agent，最后汇总各任务结果返回。除 curl / A2A Client 外，也可通过 **Streamlit 聊天页**（`:8501`）交互。
 
 ```mermaid
 flowchart TB
-    User["用户 / A2A Client / Web 聊天页"]
-    Web["Web 聊天页 :8501"]
-    Main["Main Agent :8000"]
-    Intent["Intent Agent（内嵌）"]
-    Stats["Statistics Agent :8003"]
-    Plan["Planning Agent :8001"]
-    Invest["Investment Agent :8002"]
+    subgraph Client["接入层"]
+        User["用户 / A2A Client / curl"]
+        UI["Streamlit 聊天页 :8501"]
+    end
 
-    User -->|tasks/send| Main
-    Web -->|tasks/send| Main
+    subgraph MainLayer["主控层 :8000"]
+        Main["Main Agent<br/>LangGraph 编排"]
+        Intent["Intent Agent（内嵌）"]
+        TM["TaskManager<br/>计划确认与进度"]
+        Parser["a2a_message_parser<br/>消息解析与透传"]
+    end
+
+    subgraph Business["业务 Agent 层"]
+        Plan["Planning Agent :8001<br/>项目查询 / 文件管理"]
+        Invest["Investment Agent :8002<br/>投资测算"]
+        Stats["Statistics Agent :8003<br/>规模统计"]
+    end
+
+    User -->|tasks/send / tasks/sendSubscribe| Main
+    UI -->|A2A JSON-RPC| Main
     Main --> Intent
-    Main -->|Phase 并行调度| Stats
+    Main --> TM
+    Main --> Parser
     Main -->|Phase 并行调度| Plan
     Main -->|Phase 并行调度| Invest
-    Stats --> Main
-    Plan --> Main
-    Invest --> Main
+    Main -->|Phase 并行调度| Stats
+    Plan -->|artifacts / input-required| Main
+    Invest -->|artifacts| Main
+    Stats -->|artifacts| Main
     Main -->|completed / input-required / failed| User
-    Main -->|completed / input-required / failed| Web
+    Main -->|流式轨迹 + 总结| UI
 ```
 
 ### 核心流程
 
 1. **Agent 网络发现**：主控 Agent 启动时拉取下游 Agent Card，构建可用 Skill 能力列表
-2. **意图识别**：将自然语言 query 解析为带依赖关系与 `required_capability` 的子任务规划
-3. **澄清与计划确认**：任务为空、`clarification_prompt` 非空、或 `required_agent` 无效时澄清；否则进入计划确认（`plan_confirm`），用户确认后再执行
+2. **意图识别与澄清**：将自然语言 query 解析为带依赖关系的子任务；信息不足时 `interrupt` 多轮补全
+3. **计划确认**：生成 `ManagedTaskPlan`，用户可确认执行、修改计划或取消；支持勾选部分子任务
 4. **分阶段并行**：按 DAG 拓扑分层，同层任务 `asyncio.gather` 并行，层间串行
-5. **失败熔断**：单任务最多重试 3 次，任一任务最终失败则终止后续 Phase
-6. **结果汇总**：LLM 生成自然语言总结，并保留各业务 Agent 原始 artifacts
+5. **业务交互透传**：业务 Agent 返回 `input-required` 时，主控透传确认 UI 并代传用户回复
+6. **失败熔断**：单任务最多重试 3 次，任一任务最终失败则终止后续 Phase
+7. **结果汇总**：LLM 流式生成自然语言总结，并保留各业务 Agent 原始 artifacts
+
+### 主 Agent 流程图
+
+主控 Agent 基于 LangGraph 构建，使用 `interrupt` + `MemorySaver` 支持多轮澄清、计划确认与业务 Agent 交互恢复。
+
+```mermaid
+flowchart TD
+    START([START]) --> recognize["recognize_and_check<br/>意图识别 + 澄清循环"]
+
+    recognize -->|非业务 query| direct["direct_reply<br/>LLM 直接回复"]
+    recognize -->|业务 query| prepare["prepare_plan<br/>生成 draft 计划"]
+
+    direct --> END1([END])
+
+    prepare --> approve["await_plan_approval<br/>计划确认 interrupt"]
+
+    approve -->|取消| cancelled["handle_cancelled"]
+    approve -->|修改计划| recognize
+    approve -->|确认执行| phases["build_phases<br/>DAG 拓扑分层"]
+    approve -->|未识别操作| approve
+
+    cancelled --> END2([END])
+
+    phases --> execute["execute_current_phase<br/>同层并行调用业务 Agent"]
+
+    execute -->|还有 Phase| execute
+    execute -->|全部完成 / 失败| finalize["finalize<br/>组装 artifacts"]
+    execute -->|用户取消| cancelled
+
+    finalize --> summarize["summarize<br/>LLM 流式总结"]
+    summarize --> END3([END])
+```
+
+**`recognize_and_check` 内部循环**（图中未展开）：
+
+- 子任务为空 / 存在 `clarification_prompt` → `interrupt` 等待用户补充 → 重新识别
+- `required_agent` 无效 → 先自动追加系统提示重试，超过阈值后再 `interrupt` 让用户补充
+
+**`execute_current_phase` 内部行为**：
+
+- 同 Phase 内 `asyncio.gather` 并行调用业务 Agent
+- 业务 Agent 返回 `input-required` 时 `interrupt`，收集用户回复后 resume 继续调用
+- 前置任务 artifacts 通过 `a2a_message_parser` 注入后置任务请求
 
 ## Agent 一览
 
@@ -47,7 +103,7 @@ flowchart TB
 | 投资 Agent | `investment_agent/` | 8002 | 电力项目投资测算与造价分析 |
 | 统计 Agent | `statistics_agent/` | 8003 | 电力项目规模统计与指标对比 |
 | 意图识别 | `intent_agent/` | — | 内嵌于主控 Agent，非独立服务 |
-| Web 聊天页 | `web/` | 8501 | React + FastAPI BFF，通过主控 Agent 调度业务能力 |
+| Streamlit 聊天页 | `streamlits/` | 8501 | 支持计划确认、调用轨迹与流式总结 |
 | A2A 验证器 | `a2a_validator/` | — | Streamlit 诊断工具，验证任意 A2A 端点 |
 
 ### 能力路由
@@ -73,7 +129,7 @@ flowchart TB
 | 配置管理 | `pydantic-settings` + `.env` |
 | 数据库 | SQLite（Planning Agent） |
 | HTTP 客户端 | `httpx` |
-| 验证工具 / 聊天 UI | `streamlit`（A2A 验证器）、React + FastAPI（Web 聊天页） |
+| 验证工具 / 聊天 UI | `streamlit`（A2A 验证器、聊天页） |
 | 测试 | `pytest`, `pytest-asyncio` |
 
 ## 目录结构
@@ -85,12 +141,12 @@ powerproj-agent/
 ├── a2a_validator/           # A2A 协议验证工具（Streamlit）
 ├── config/                  # 全局配置（pydantic-settings）
 ├── intent_agent/            # 意图识别 Agent（LangGraph，内嵌于主控）
-├── main_agent/              # 主控 Agent（编排调度）
+├── main_agent/              # 主控 Agent（编排调度、TaskManager）
 ├── planning_agent/          # 规划 Agent（SQLite + 文件管理）
 ├── investment_agent/        # 投资 Agent
 ├── statistics_agent/        # 统计 Agent
 ├── providers/               # LLM 统一实例化
-├── web/                     # Web 聊天页（React 前端 + FastAPI BFF）
+├── streamlits/              # Streamlit 聊天页
 ├── scripts/                 # 一键启动 / 停止脚本
 ├── examples/                # A2A 调用示例与演示脚本
 ├── spec/                    # 各 Agent 技术规格文档
@@ -147,7 +203,7 @@ MINERU_API_KEY=your-mineru-key
 bash scripts/start_all.sh
 ```
 
-脚本会依次启动三个业务 Agent、主控 Agent 和 Web 聊天页，日志写入 `logs/` 目录。停止所有服务：
+脚本会依次启动三个业务 Agent、主控 Agent 和 Streamlit 聊天页，日志写入 `logs/` 目录。停止所有服务：
 
 ```bash
 bash scripts/stop_all.sh
@@ -159,7 +215,7 @@ bash scripts/stop_all.sh
 | 投资 Agent | http://localhost:8002 |
 | 统计 Agent | http://localhost:8003 |
 | 主控 Agent | http://localhost:8000 |
-| Web 聊天页 | http://localhost:8501 |
+| Streamlit 聊天页 | http://localhost:8501 |
 
 #### 方式二：分别启动
 
@@ -176,11 +232,8 @@ python statistics_agent/main.py
 # 终端 4 - 主控 Agent（用户入口）
 python main_agent/server.py
 
-# 终端 5 - Web BFF（可选）
-uvicorn web.server:app --reload --port 8501
-
-# 终端 6 - Web 前端开发（可选，需先启动 BFF）
-cd web/frontend && npm install && npm run dev
+# 终端 5 - Streamlit 聊天页（可选）
+streamlit run streamlits/app.py --server.port 8501
 ```
 
 启动后可访问各 Agent 的 Agent Card（a2a-sdk 默认路径）：
@@ -194,9 +247,9 @@ curl http://localhost:8003/.well-known/agent-card.json   # 统计
 
 ### 4. 发送请求
 
-#### Web 聊天页
+#### Streamlit 聊天页
 
-浏览器开发模式打开 http://localhost:5173 （Vite 代理 `/api` 到 BFF）；生产构建后访问 http://localhost:8501 。页面会自动处理 `input-required` 多轮补全、计划确认与流式调用轨迹。
+浏览器打开 http://localhost:8501 。页面支持 `input-required` 多轮补全、计划确认（勾选子任务 / 修改 / 取消）、结构化确认按钮与流式调用轨迹。
 
 #### curl / A2A Client
 
@@ -320,6 +373,7 @@ pytest intent_agent/tests/functional -v
 | 文档 | 说明 |
 |------|------|
 | [`spec/main_agent_spec.md`](spec/main_agent_spec.md) | 主控 Agent：编排流程、LangGraph 状态图、A2A 接口 |
+| [`spec/task_manager_spec.md`](spec/task_manager_spec.md) | 任务计划管理：计划确认、进度事件、取消与重规划 |
 | [`spec/intent_agent_spec.md`](spec/intent_agent_spec.md) | 意图识别：任务规划模型、Prompt 规范 |
 | [`spec/planning_agent_spec.md`](spec/planning_agent_spec.md) | 规划 Agent：数据模型、节点流程、文件管理 |
 | [`spec/a2a_validator_spec.md`](spec/a2a_validator_spec.md) | A2A 验证器：验证项与输出结构 |
@@ -330,7 +384,8 @@ pytest intent_agent/tests/functional -v
 
 - **LangGraph 节点极简**：每个节点只做一件事，状态通过 `state` 对象传递
 - **能力驱动路由**：子任务通过 `required_capability` 匹配 AgentCard Skill，而非硬编码业务类型
-- **中断恢复**：使用 `interrupt` + `Command(resume=...)` 实现多轮交互，不引入外部消息队列
+- **中断恢复**：使用 `interrupt` + `Command(resume=...)` 实现多轮交互（澄清、计划确认、业务确认），不引入外部消息队列
+- **计划确认**：`TaskManager` 管理 `ManagedTaskPlan` 生命周期，用户确认后才进入 Phase 执行
 - **Phase 分层并行**：DAG 拓扑分层，同层并行、层间串行
 - **任务级熔断**：单任务重试 3 次仍失败，立即停止后续 Phase
 - **LLM 集中管理**：统一由 `providers/llm_provider.py` 实例化，禁止各模块自行创建模型客户端
