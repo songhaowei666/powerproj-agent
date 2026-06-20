@@ -430,24 +430,56 @@ class TestGraph:
 
     @pytest.mark.asyncio
     async def test_unknown_intent(self, mock_llm, temp_db, temp_fm):
-        """未知意图导致任务失败。"""
-        intent_mock = MagicMock()
-        intent_mock.ainvoke = AsyncMock(return_value={"intent": "unknown"})
+        """未知意图触发澄清 interrupt，用户补充后可继续。"""
+        intent_mock_unknown = MagicMock()
+        intent_mock_unknown.ainvoke = AsyncMock(return_value={"intent": "unknown"})
+        intent_mock_query = MagicMock()
+        intent_mock_query.ainvoke = AsyncMock(return_value={"intent": "query_project"})
+
+        filter_mock = MagicMock()
+        filter_mock.keywords = "北京西"
+        filter_mock.voltage_level = None
+        filter_mock.unit_code = None
+        filter_mock.min_line_length = None
+        filter_mock.max_line_length = None
+        filter_mock.min_substation_capacity = None
+        filter_mock.max_substation_capacity = None
+
         mock_llm.with_structured_output = MagicMock(
-            return_value=intent_mock
+            side_effect=[
+                intent_mock_unknown,
+                intent_mock_query,
+                MagicMock(ainvoke=AsyncMock(return_value=filter_mock)),
+            ]
         )
 
         graph = build_planning_graph(mock_llm, temp_db, temp_fm)
         state = PlanningState(query="随便说点什么")
-        result = await graph.ainvoke(
-            state, config={"configurable": {"thread_id": "test-unknown-1"}}
+        with patch("planning_agent.graph._is_aggregate_query", return_value=False):
+            result = await graph.ainvoke(
+                state, config={"configurable": {"thread_id": "test-unknown-1"}}
+            )
+
+        graph_state = await graph.aget_state(
+            config={"configurable": {"thread_id": "test-unknown-1"}}
         )
-        assert result.get("status") == "failed"
-        assert "无法理解" in result.get("result_text", "")
+        assert graph_state.next is not None
+        interrupt_info = graph_state.tasks[0].interrupts[0].value
+        assert interrupt_info.get("type") == "intent_clarify"
+        assert "无法理解您的意图" in interrupt_info.get("question", "")
+
+        with patch("planning_agent.graph._is_aggregate_query", return_value=False):
+            result = await graph.ainvoke(
+                Command(resume="我想查询项目信息"),
+                config={"configurable": {"thread_id": "test-unknown-1"}},
+            )
+
+        assert result.get("intent") == "query_project"
+        assert result.get("status") != "failed"
 
     @pytest.mark.asyncio
     async def test_parse_intent_exception_fallback(self, mock_llm, temp_db, temp_fm):
-        """parse_intent LLM 异常时 intent 回退为 unknown。"""
+        """parse_intent LLM 异常时返回系统 failed，而非业务 unknown。"""
         intent_mock = MagicMock()
         intent_mock.ainvoke = AsyncMock(side_effect=Exception("LLM error"))
         mock_llm.with_structured_output = MagicMock(return_value=intent_mock)
@@ -458,7 +490,7 @@ class TestGraph:
             state, config={"configurable": {"thread_id": "test-intent-exception-1"}}
         )
         assert result.get("status") == "failed"
-        assert result.get("intent") == "unknown"
+        assert "意图识别服务异常" in (result.get("result_text") or "")
 
     @pytest.mark.asyncio
     async def test_match_project_no_result(self, mock_llm, temp_db, temp_fm):

@@ -1,10 +1,10 @@
 """LangGraph 状态图定义与节点实现。"""
 
 import base64
-from typing import Any, Dict, List
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import MemorySaver
@@ -19,6 +19,20 @@ from a2a_message_parser import (
 from planning_agent.project_matcher import ProjectMatcher
 
 
+logger = logging.getLogger(__name__)
+
+ALLOWED_INTENTS = frozenset(
+    {
+        "query_project",
+        "upload_file",
+        "download_file",
+        "delete_file",
+    }
+)
+
+INTENT_CLARIFICATION_QUESTION = (
+    "无法理解您的意图，请明确说明您想查询项目、上传文件、下载文件还是删除文件。"
+)
 # ---------- Prompts ----------
 
 INTENT_SYSTEM_PROMPT = """你是一位智能助手，负责解析用户的自然语言意图。
@@ -126,6 +140,37 @@ def _build_intent_input(state: PlanningState) -> str:
     )
 
 
+async def _recognize_intent(
+    llm: BaseChatModel, query_text: str
+) -> Tuple[str, Optional[str]]:
+    """调用 LLM 识别意图。
+
+    Returns:
+        (intent, system_error)：system_error 非空表示系统异常，intent 为业务分类结果。
+    """
+    structured_llm = llm.with_structured_output(
+        schema=dict,
+        method="json_mode",
+    )
+    try:
+        result = await structured_llm.ainvoke(
+            [
+                ("system", INTENT_SYSTEM_PROMPT),
+                (
+                    "human",
+                    f'请解析以下用户输入的意图，返回 JSON {{"intent": "意图类型"}}：\n{query_text}',
+                ),
+            ]
+        )
+        intent = result.get("intent", "unknown")
+        if intent not in ALLOWED_INTENTS:
+            intent = "unknown"
+        return intent, None
+    except Exception as exc:
+        logger.exception("planning-agent 意图识别 LLM 调用失败")
+        return "unknown", f"意图识别服务异常：{type(exc).__name__}: {exc}"
+
+
 def build_planning_graph(
     llm: BaseChatModel,
     db: ProjectDatabase,
@@ -136,39 +181,43 @@ def build_planning_graph(
     matcher = ProjectMatcher(db, llm)
 
     async def parse_intent(state: PlanningState) -> PlanningState:
-        """解析用户意图。"""
-        structured_llm = llm.with_structured_output(
-            schema=dict,
-            method="json_mode",
+        """解析用户意图；系统异常与业务 unknown 分开处理。"""
+        intent, system_error = await _recognize_intent(
+            llm, _build_intent_input(state)
         )
-        try:
-            result = await structured_llm.ainvoke(
-                [
-                    ("system", INTENT_SYSTEM_PROMPT),
-                    (
-                        "human",
-                        f'请解析以下用户输入的意图，返回 JSON {{"intent": "意图类型"}}：\n{_build_intent_input(state)}',
-                    ),
-                ]
-            )
-            intent = result.get("intent", "unknown")
-            if intent not in [
-                "query_project",
-                "upload_file",
-                "download_file",
-                "delete_file",
-            ]:
-                intent = "unknown"
-            state.intent = intent
-        except Exception:
+        if system_error:
             state.intent = "unknown"
+            state.status = "failed"
+            state.result_text = system_error
+            return state
+        state.intent = intent
         return state
+
+    async def clarify_intent(state: PlanningState) -> PlanningState:
+        """意图不明时暂停，等待用户补充说明后重新识别。"""
+        if state.status == "failed":
+            return state
+
+        user_reply = interrupt(
+            {
+                "type": "intent_clarify",
+                "question": INTENT_CLARIFICATION_QUESTION,
+            }
+        )
+        state.query = f"{state.query}\n补充说明：{user_reply}"
+        return state
+
+    def route_after_parse_intent(state: PlanningState) -> str:
+        """意图识别后的路由：系统失败 / 待澄清 / 继续匹配项目。"""
+        if state.status == "failed":
+            return "finalize"
+        if state.intent == "unknown":
+            return "clarify_intent"
+        return "match_project"
 
     async def match_project(state: PlanningState) -> PlanningState:
         """匹配项目。聚合查询跳过项目匹配。"""
-        if state.intent == "unknown":
-            state.status = "failed"
-            state.result_text = "无法理解您的意图，请明确说明您想查询项目、上传文件、下载文件还是删除文件。"
+        if state.status == "failed":
             return state
 
         # 聚合查询不需要匹配具体项目
@@ -463,6 +512,7 @@ def build_planning_graph(
     workflow = StateGraph(PlanningState)
 
     workflow.add_node("parse_intent", parse_intent)
+    workflow.add_node("clarify_intent", clarify_intent)
     workflow.add_node("match_project", match_project)
     workflow.add_node("confirm_project", confirm_project)
     workflow.add_node("resolve_params", resolve_params)
@@ -470,7 +520,16 @@ def build_planning_graph(
     workflow.add_node("finalize", finalize)
 
     workflow.set_entry_point("parse_intent")
-    workflow.add_edge("parse_intent", "match_project")
+    workflow.add_conditional_edges(
+        "parse_intent",
+        route_after_parse_intent,
+        {
+            "finalize": "finalize",
+            "clarify_intent": "clarify_intent",
+            "match_project": "match_project",
+        },
+    )
+    workflow.add_edge("clarify_intent", "parse_intent")
     workflow.add_edge("match_project", "confirm_project")
     workflow.add_edge("confirm_project", "resolve_params")
     workflow.add_edge("resolve_params", "execute_action")

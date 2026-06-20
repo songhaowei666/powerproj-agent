@@ -8,7 +8,12 @@ PLAN_MEDIA_TYPE = "application/vnd.powerproj.plan+json"
 
 DEFAULT_PLAN_CONFIRM_OPTIONS: List[Dict[str, str]] = [
     {"id": "approve", "label": "开始执行", "replyText": "确认执行"},
-    {"id": "modify", "label": "修改计划", "replyText": "修改计划："},
+    {
+        "id": "modify",
+        "label": "修改计划",
+        "replyText": "修改计划：",
+        "inputRequired": True,
+    },
     {"id": "cancel", "label": "取消", "replyText": "取消"},
 ]
 

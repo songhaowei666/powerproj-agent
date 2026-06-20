@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
 
-from web.client import MainAgentClient, StreamEvent, parse_chat_response, ConfirmationUI
+from streamlits.client import MainAgentClient, StreamEvent, parse_chat_response, ConfirmationUI
 from main_agent.task_manager import format_plan_approve_reply
 
 DEFAULT_BASE_URL = "http://localhost:8000"
@@ -258,7 +258,7 @@ def _render_confirmation_buttons(confirmation: ConfirmationUI, task_id: str) -> 
 
 
 def _render_plan_confirm_ui(confirmation: ConfirmationUI, task_id: str) -> None:
-    """渲染计划确认勾选框与操作按钮。"""
+    """渲染计划确认勾选框、修改说明输入区与操作按钮。"""
     body = confirmation.body or {}
     tasks = body.get("tasks") or []
     revision = int(body.get("revision") or 1)
@@ -279,16 +279,25 @@ def _render_plan_confirm_ui(confirmation: ConfirmationUI, task_id: str) -> None:
         st.checkbox(label, value=True, key=checkbox_key)
         checkbox_items.append((checkbox_key, task_id_value))
 
+    modify_text_key = f"plan_modify_text_{task_id}_{revision}"
+    st.text_area(
+        "修改说明（如需调整计划，请描述后再点「提交修改」）",
+        key=modify_text_key,
+        placeholder="例如：去掉投资分析，增加规划 agent 查询项目信息",
+        height=88,
+    )
+
     all_task_ids = [item[1] for item in checkbox_items]
     approve_option = next(
         (option for option in confirmation.options if option.get("id") == "approve"),
         None,
     )
-    other_options = [
-        option for option in confirmation.options if option.get("id") != "approve"
-    ]
-    button_count = (1 if approve_option else 0) + len(other_options)
-    cols = st.columns(max(button_count, 1))
+    cancel_option = next(
+        (option for option in confirmation.options if option.get("id") == "cancel"),
+        None,
+    )
+
+    cols = st.columns(3)
     col_index = 0
 
     if approve_option:
@@ -312,17 +321,31 @@ def _render_plan_confirm_ui(confirmation: ConfirmationUI, task_id: str) -> None:
                 st.rerun()
         col_index += 1
 
-    for option in other_options:
-        with cols[col_index]:
-            if st.button(
-                option["label"],
-                key=f"plan_action_{task_id}_{revision}_{option['id']}",
-                use_container_width=True,
-            ):
-                st.session_state.confirmation_reply = option["replyText"]
+    with cols[col_index]:
+        if st.button(
+            "提交修改",
+            key=f"plan_submit_modify_{task_id}_{revision}",
+            use_container_width=True,
+        ):
+            modify_text = str(st.session_state.get(modify_text_key, "") or "").strip()
+            if not modify_text:
+                st.warning("请填写修改说明后再提交")
+            else:
+                st.session_state.confirmation_reply = f"修改计划：{modify_text}"
                 st.session_state.pending_confirmation = None
                 st.rerun()
-        col_index += 1
+    col_index += 1
+
+    if cancel_option:
+        with cols[col_index]:
+            if st.button(
+                cancel_option["label"],
+                key=f"plan_action_{task_id}_{revision}_cancel",
+                use_container_width=True,
+            ):
+                st.session_state.confirmation_reply = cancel_option["replyText"]
+                st.session_state.pending_confirmation = None
+                st.rerun()
 
 
 def _render_confirmation_ui(confirmation: ConfirmationUI, task_id: str) -> None:

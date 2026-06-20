@@ -2,7 +2,8 @@
 a2a-sdk
 langchain
 langchain-openai
-langgraph
+langgraph>=1.2.0
+langgraph-checkpoint>=4.1.0
 pydantic
 pydantic-settings
 starlette
