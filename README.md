@@ -9,36 +9,23 @@
 ```mermaid
 flowchart TB
     subgraph Client["接入层"]
+        direction LR
         User["用户 / A2A Client / curl"]
         UI["Streamlit 聊天页 :8501"]
     end
 
-    subgraph MainLayer["主控层 :8000"]
-        Main["Main Agent<br/>LangGraph 编排"]
-        Intent["Intent Agent（内嵌）"]
-        TM["TaskManager<br/>计划确认与进度"]
-        Parser["a2a_message_parser<br/>消息解析与透传"]
+    Main["主控 Agent :8000<br/>LangGraph 编排<br/>Intent Agent · TaskManager · a2a_message_parser"]
+
+    subgraph Biz["业务 Agent 层"]
+        direction LR
+        Plan["Planning :8001<br/>项目查询 / 文件管理"]
+        Invest["Investment :8002<br/>投资测算"]
+        Stats["Statistics :8003<br/>规模统计"]
     end
 
-    subgraph Business["业务 Agent 层"]
-        Plan["Planning Agent :8001<br/>项目查询 / 文件管理"]
-        Invest["Investment Agent :8002<br/>投资测算"]
-        Stats["Statistics Agent :8003<br/>规模统计"]
-    end
-
-    User -->|tasks/send / tasks/sendSubscribe| Main
-    UI -->|A2A JSON-RPC| Main
-    Main --> Intent
-    Main --> TM
-    Main --> Parser
-    Main -->|Phase 并行调度| Plan
-    Main -->|Phase 并行调度| Invest
-    Main -->|Phase 并行调度| Stats
-    Plan -->|artifacts / input-required| Main
-    Invest -->|artifacts| Main
-    Stats -->|artifacts| Main
-    Main -->|completed / input-required / failed| User
-    Main -->|流式轨迹 + 总结| UI
+    Client -->|A2A JSON-RPC| Main
+    Main <-->|Phase 并行调度| Biz
+    Main -->|结果 / 流式轨迹| Client
 ```
 
 ### 核心流程
@@ -57,10 +44,10 @@ flowchart TB
 
 ```mermaid
 flowchart TD
-    START([START]) --> recognize["recognize_and_check<br/>意图识别 + 澄清循环"]
+    START([START]) --> recognize["recognize_and_check<br/>意图识别 + 澄清"]
 
-    recognize -->|非业务 query| direct["direct_reply<br/>LLM 直接回复"]
-    recognize -->|业务 query| prepare["prepare_plan<br/>生成 draft 计划"]
+    recognize -->|非业务 query| direct["direct_reply"]
+    recognize -->|业务 query| prepare["prepare_plan"]
 
     direct --> END1([END])
 
@@ -76,7 +63,7 @@ flowchart TD
     phases --> execute["execute_current_phase<br/>同层并行调用业务 Agent"]
 
     execute -->|还有 Phase| execute
-    execute -->|全部完成 / 失败| finalize["finalize<br/>组装 artifacts"]
+    execute -->|全部完成 / 失败| finalize["finalize"]
     execute -->|用户取消| cancelled
 
     finalize --> summarize["summarize<br/>LLM 流式总结"]
