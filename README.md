@@ -40,44 +40,48 @@ flowchart TB
 
 ### 主 Agent 流程图
 
-主控 Agent 基于 LangGraph 构建，使用 `interrupt` + `MemorySaver` 支持多轮澄清、计划确认与业务 Agent 交互恢复。
+主控 Agent 基于 LangGraph 构建，使用 `interrupt` + `MemorySaver` 支持多轮澄清、计划确认与业务 Agent 交互恢复。下图使用 `stateDiagram-v2`（节点名与 `main_agent/graph.py` 一致），在 GitHub 上比复杂 `flowchart` 更易读。
 
 ```mermaid
-flowchart TD
-    START([START]) --> recognize["recognize_and_check<br/>意图识别 + 澄清"]
+stateDiagram-v2
+    [*] --> recognize_and_check
 
-    recognize -->|非业务 query| direct["direct_reply"]
-    recognize -->|业务 query| prepare["prepare_plan"]
+    recognize_and_check --> direct_reply: 非业务 query
+    recognize_and_check --> prepare_plan: 业务 query
+    direct_reply --> [*]
 
-    direct --> END1([END])
+    prepare_plan --> await_plan_approval
+    await_plan_approval --> recognize_and_check: 修改计划
+    await_plan_approval --> recognize_and_check: 未识别回复，视为修改
+    await_plan_approval --> build_phases: 确认执行
+    await_plan_approval --> handle_cancelled: 取消
 
-    prepare --> approve["await_plan_approval<br/>计划确认 interrupt"]
+    build_phases --> execute_current_phase
+    execute_current_phase --> execute_current_phase: 还有 Phase
+    execute_current_phase --> finalize: 全部完成或失败
+    execute_current_phase --> handle_cancelled: 用户取消
 
-    approve -->|取消| cancelled["handle_cancelled"]
-    approve -->|修改计划| recognize
-    approve -->|确认执行| phases["build_phases<br/>DAG 拓扑分层"]
-    approve -->|未识别操作| approve
-
-    cancelled --> END2([END])
-
-    phases --> execute["execute_current_phase<br/>同层并行调用业务 Agent"]
-
-    execute -->|还有 Phase| execute
-    execute -->|全部完成 / 失败| finalize["finalize"]
-    execute -->|用户取消| cancelled
-
-    finalize --> summarize["summarize<br/>LLM 流式总结"]
-    summarize --> END3([END])
+    finalize --> summarize
+    summarize --> [*]
+    handle_cancelled --> [*]
 ```
 
-**`recognize_and_check` 内部循环**（图中未展开）：
+| 节点 | 说明 |
+|------|------|
+| `recognize_and_check` | 意图识别；信息不足时 `interrupt` 多轮澄清 |
+| `prepare_plan` | 生成 `ManagedTaskPlan` |
+| `await_plan_approval` | 计划确认 `interrupt`，支持勾选子任务；回复须匹配「确认执行 / 修改计划 / 取消」，否则视为修改说明 |
+| `build_phases` | 按 DAG 拓扑分层 |
+| `execute_current_phase` | 同 Phase 内 `asyncio.gather` 并行调用业务 Agent |
+| `finalize` / `summarize` | 收尾并 LLM 流式总结 |
 
-- 子任务为空 / 存在 `clarification_prompt` → `interrupt` 等待用户补充 → 重新识别
+**`recognize_and_check` 内部**（不单独画边，在节点内 `interrupt` 后重试）：
+
+- 子任务为空 / 存在 `clarification_prompt` → 等待用户补充 → 重新识别
 - `required_agent` 无效 → 先自动追加系统提示重试，超过阈值后再 `interrupt` 让用户补充
 
-**`execute_current_phase` 内部行为**：
+**`execute_current_phase` 内部**：
 
-- 同 Phase 内 `asyncio.gather` 并行调用业务 Agent
 - 业务 Agent 返回 `input-required` 时 `interrupt`，收集用户回复后 resume 继续调用
 - 前置任务 artifacts 通过 `a2a_message_parser` 注入后置任务请求
 
